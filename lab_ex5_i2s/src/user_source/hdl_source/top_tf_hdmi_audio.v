@@ -163,6 +163,100 @@ always @(posedge ext_mem_clk or posedge rst_all) begin
         frame_write_toggle_mem <= ~frame_write_toggle_mem;
 end
 
+// ===================== 视频播放模式（KEY2 长按 >1.5s 切换）=====================
+wire k2_short, k2_long;
+key_short_long #(
+    .CLK_FREQ_HZ (25_000_000),
+    .LONG_MS     (1500)
+) u_key2_video (
+    .clk         (video_clk),
+    .rst         (rst_all),
+    .button      (key1),                 // 板上 KEY_2
+    .short_pulse (k2_short),
+    .long_pulse  (k2_long)
+);
+
+reg video_mode;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all)      video_mode <= 1'b0;
+    else if (k2_long) video_mode <= ~video_mode;
+end
+
+// 视频模式下屏蔽图像路径的按键（高=未按下），避免它去抢 SD 卡
+wire key_next_img = video_mode ? 1'b1 : key1;
+wire key_auto_img = video_mode ? 1'b1 : key2;
+
+// ---- 图像路径（sd_card_bmp）的原始信号 ----
+wire        img_display_valid;
+wire [1:0]  img_write_buf_idx;
+wire [1:0]  img_disp_buf_idx;
+wire        img_write_req;
+wire        img_write_en;
+wire [31:0] img_write_data;
+
+// ---- 扇区读通道：sd_card_bmp 的那一对端口 ----
+wire [7:0]  sec_from_bmp_data;
+wire        sec_from_bmp_data_valid;
+wire        sec_from_bmp_end;
+wire        sec_to_bmp_read;
+wire [31:0] sec_to_bmp_read_addr;
+
+// ---- 视频播放器 ----
+wire        vid_sec_read;
+wire [31:0] vid_sec_read_addr;
+wire [7:0]  vid_sec_read_data;
+wire        vid_sec_read_data_valid;
+wire        vid_sec_read_end;
+wire        vid_wr_req;
+wire        vid_wr_en;
+wire [31:0] vid_wr_data;
+wire        vid_display_valid;
+wire [1:0]  vid_disp_buf_idx;
+wire [1:0]  vid_write_buf_idx;
+wire        vid_active;
+
+video_player #(
+    .CLK_FREQ_HZ (100_000_000)
+) u_video_player (
+    .clk                 (sd_card_clk),
+    .rst                 (rst_all),
+    .enable              (video_mode),
+    .sec_read            (vid_sec_read),
+    .sec_read_addr       (vid_sec_read_addr),
+    .sec_read_data       (vid_sec_read_data),
+    .sec_read_data_valid (vid_sec_read_data_valid),
+    .sec_read_end        (vid_sec_read_end),
+    .wr_req              (vid_wr_req),
+    .wr_req_ack          (sd_card_write_req_ack),
+    .wr_en               (vid_wr_en),
+    .wr_data             (vid_wr_data),
+    .wr_finish           (frame_write_toggle_mem),
+    .display_valid       (vid_display_valid),
+    .disp_buf_idx        (vid_disp_buf_idx),
+    .write_buf_idx       (vid_write_buf_idx),
+    .active              (vid_active)
+);
+
+// ---- 帧写通道与显示控制：视频模式接管，否则用图像路径 ----
+assign display_valid      = video_mode ? vid_display_valid : img_display_valid;
+assign disp_buf_idx       = video_mode ? vid_disp_buf_idx  : img_disp_buf_idx;
+assign write_buf_idx      = video_mode ? vid_write_buf_idx : img_write_buf_idx;
+assign sd_card_write_req  = video_mode ? vid_wr_req        : img_write_req;
+assign sd_card_write_en   = video_mode ? vid_wr_en         : img_write_en;
+assign sd_card_write_data = video_mode ? vid_wr_data       : img_write_data;
+
+// ---- 扇区读通道：视频模式独占（音乐自动让路）；否则给 WAV 播放器 ----
+assign sec_to_bmp_read      = video_mode ? vid_sec_read      : wav_sec_read;
+assign sec_to_bmp_read_addr = video_mode ? vid_sec_read_addr : wav_sec_read_addr;
+
+assign vid_sec_read_data       = sec_from_bmp_data;
+assign vid_sec_read_data_valid = sec_from_bmp_data_valid &  video_mode;
+assign vid_sec_read_end        = sec_from_bmp_end        &  video_mode;
+
+assign wav_sec_read_data       = sec_from_bmp_data;
+assign wav_sec_read_data_valid = sec_from_bmp_data_valid & ~video_mode;
+assign wav_sec_read_end        = sec_from_bmp_end        & ~video_mode;
+
 // ===================== TF 多图扫描与缓存（双缓冲） =====================
 sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
@@ -174,32 +268,32 @@ sd_card_bmp #(
 ) sd_card_bmp_m0(
     .clk               (sd_card_clk),
     .rst               (rst_all),
-    .key_next          (key1),
-    .key_auto          (key2),
+    .key_next          (key_next_img),
+    .key_auto          (key_auto_img),
     .state_code        (state_code),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
-    .display_valid     (display_valid),
+    .display_valid     (img_display_valid),
 
     .write_finish_toggle(frame_write_toggle_mem),
-    .write_buf_idx     (write_buf_idx),
-    .disp_buf_idx      (disp_buf_idx),
+    .write_buf_idx     (img_write_buf_idx),
+    .disp_buf_idx      (img_disp_buf_idx),
 
-    .write_req         (sd_card_write_req),
+    .write_req         (img_write_req),
     .write_req_ack     (sd_card_write_req_ack),
-    .write_en          (sd_card_write_en),
-    .write_data        (sd_card_write_data),
+    .write_en          (img_write_en),
+    .write_data        (img_write_data),
     .SD_nCS            (sd_ncs),
     .SD_DCLK           (sd_dclk),
     .SD_MOSI           (sd_mosi),
     .SD_MISO           (sd_miso),
 
-    // ===== 音频：WAV 播放器的扇区读通道（内部与图像请求仲裁，图像优先）=====
-    .wav_sec_read            (wav_sec_read),
-    .wav_sec_read_addr       (wav_sec_read_addr),
-    .wav_sec_read_data       (wav_sec_read_data),
-    .wav_sec_read_data_valid (wav_sec_read_data_valid),
-    .wav_sec_read_end        (wav_sec_read_end)
+    // ===== 扇区读通道（视频模式由视频播放器独占，否则给 WAV）=====
+    .wav_sec_read            (sec_to_bmp_read),
+    .wav_sec_read_addr       (sec_to_bmp_read_addr),
+    .wav_sec_read_data       (sec_from_bmp_data),
+    .wav_sec_read_data_valid (sec_from_bmp_data_valid),
+    .wav_sec_read_end        (sec_from_bmp_end)
 );
 
 seg_decoder seg_decoder_m0(
@@ -470,7 +564,7 @@ wav_audio #(
     .sd_rst              (rst_all),
     .vid_clk             (video_clk),
     .vid_rst             (rst_all),
-    .enable              (display_valid),      // 首图显示后，扫描已完成，才去读音频
+    .enable              (display_valid & ~video_mode),   // 视频模式时音频让路
     .sec_read            (wav_sec_read),
     .sec_read_addr       (wav_sec_read_addr),
     .sec_read_data       (wav_sec_read_data),
