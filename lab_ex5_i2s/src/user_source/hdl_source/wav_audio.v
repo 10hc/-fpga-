@@ -84,7 +84,8 @@ module wav_audio #(
             data_left     <= 32'd0;
             data_start    <= 32'd0;
             wrp           <= 9'd0;
-            rdp           <= 9'd0;
+            // 注意：rdp 只在下面"48kHz 节拍 + 握手"那个 always 块里驱动
+            //      （包括它的复位），否则综合器会报 multiple drivers
         end else begin
             case (st)
                 // ---------- 等待使能 ----------
@@ -198,6 +199,7 @@ module wav_audio #(
             s_l      <= 24'd0;
             s_r      <= 24'd0;
             ack_sync <= 2'd0;
+            rdp      <= 9'd0;                              // rdp 唯一驱动点
         end else begin
             ack_sync <= {ack_sync[0], ack};
             if (!s_valid) begin
