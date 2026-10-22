@@ -459,8 +459,10 @@ I2S_receiver u_I2S_receiver(
 );
 
 // ===================== 音频源：TF 卡 WAV 优先，找不到则用测试音 =====================
+// 注意：sd_card_clk 由 sys_pll 的 clk0 提供，实测配置为 100MHz（不是 50MHz！）
+//       48kHz 节拍按这个频率计算，写错会导致采样率翻倍、声音失真
 wav_audio #(
-    .SD_CLK_HZ   (50_000_000),
+    .SD_CLK_HZ   (100_000_000),
     .VID_CLK_HZ  (25_000_000),
     .SAMPLE_RATE (48_000)
 ) u_wav_audio (
