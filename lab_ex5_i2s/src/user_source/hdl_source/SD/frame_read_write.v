@@ -69,8 +69,19 @@ module frame_read_write
 	input[1:0]                       write_addr_index,           // select valid base address from write_addr_0 write_addr_1 write_addr_2 write_addr_3
 	input[ADDR_BITS - 1:0]           write_len,                  // data write module write request data length
 	input                            write_en,                   // data write module write request for one data
-	input[WRITE_DATA_BITS - 1:0]     write_data                 // write data
+	input[WRITE_DATA_BITS - 1:0]     write_data,                // write data
 
+	// ===== 转场特效（新增）=====
+	input                            trans_en,
+	input[1:0]                       trans_effect,
+	input[9:0]                       trans_offset,
+	input[ADDR_BITS - 1:0]           trans_old_base,
+	input[ADDR_BITS - 1:0]           trans_new_base,
+
+	output[3:0]   dbg_rd_state,
+	output        dbg_rd_wrbusy,
+	output        dbg_rd_req2,
+	output        dbg_rd_init
 );
 wire[BURST_BITS - 1:0]                           wrusedw;                    // write used words
 wire[BURST_BITS - 1:0]                           rdusedw;                    // read used words
@@ -187,7 +198,17 @@ frame_fifo_read_m0
 	.read_addr_index            (read_addr_index          ),    
 	.read_len                   (read_len                 ),
 	.fifo_aclr                  (read_fifo_aclr           ),
-	.wrusedw                	(wrusedw                  )
+	.wrusedw                	(wrusedw                  ),
+	// ===== 转场特效 =====
+	.trans_en					(trans_en                 ),
+	.trans_effect				(trans_effect             ),
+	.trans_offset				(trans_offset             ),
+	.trans_old_base				(trans_old_base           ),
+	.trans_new_base				(trans_new_base           ),
+	.dbg_state(dbg_rd_state),
+	.dbg_wrbusy(dbg_rd_wrbusy),
+	.dbg_req2(dbg_rd_req2),
+	.dbg_init(dbg_rd_init)
 );
 
 endmodule

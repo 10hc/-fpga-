@@ -234,6 +234,45 @@ wire [23:0] diag_color =
                            24'h404040;
 assign vout_data = display_valid ? vout_data_raw : diag_color;
 
+// ===================== 花样转场：滑动 / 栅格 / 淡入淡出 =====================
+// disp_buf_idx 同步到 mem_clk 域，用于检测"切图脉冲"
+reg [1:0] disp_sync0, disp_sync1, disp_sync2;
+always @(posedge ext_mem_clk or posedge rst_all) begin
+    if (rst_all) begin
+        disp_sync0 <= 2'd0;
+        disp_sync1 <= 2'd0;
+        disp_sync2 <= 2'd0;
+    end else begin
+        disp_sync0 <= disp_buf_idx;
+        disp_sync1 <= disp_sync0;
+        disp_sync2 <= disp_sync1;
+    end
+end
+wire switch_pulse = (disp_sync2 != disp_sync1);
+
+wire        read_finish;
+wire        trans_en;
+wire [1:0]  trans_effect;
+wire [9:0]  trans_offset;
+wire [8:0]  fade_factor;
+
+// 每次切图自动轮换效果：滑动 → 栅格 → 淡入淡出 → 滑动 …
+// 以"每帧读完"为节拍推进，帧内参数恒定 → 画面平滑
+trans_ctrl u_trans_ctrl(
+    .clk          (ext_mem_clk),
+    .rst          (rst_all),
+    .switch_pulse (switch_pulse),
+    .frame_done   (read_finish),
+    .trans_effect (trans_effect),
+    .trans_en     (trans_en),
+    .trans_offset (trans_offset),
+    .fade_factor  (fade_factor)
+);
+
+// 转场时读的"旧/新"缓冲基址（disp_sync2 = 当前显示 = 新图）
+wire [20:0] trans_new_base = (disp_sync2 == 2'd0) ? BUF0_ADDR[20:0] : BUF1_ADDR[20:0];
+wire [20:0] trans_old_base = (disp_sync2 == 2'd0) ? BUF1_ADDR[20:0] : BUF0_ADDR[20:0];
+
 // ===================== 扩展①/④：亮度对比度 + OSD 文字 =====================
 // KEY3：短按 → 亮度循环切换；长按（>1s）→ 对比度循环切换
 wire k3_short, k3_long;
@@ -269,6 +308,16 @@ video_adjust u_video_adjust(
     .rgb_out     (vout_data_adj)
 );
 
+wire [23:0] vout_data_fade;
+video_fade u_video_fade(
+    .clk         (video_clk),
+    .rst         (rst_all),
+    .de          (de),
+    .fade_factor (fade_factor),
+    .rgb_in      (vout_data_adj),
+    .rgb_out     (vout_data_fade)
+);
+
 wire osd_on = 1'b1;   // OSD 文字常开
 
 wire [23:0] vout_data_osd;
@@ -278,7 +327,7 @@ osd_overlay u_osd_overlay(
     .de      (de),
     .vs      (vs),
     .osd_en  (osd_on),
-    .rgb_in  (vout_data_adj),
+    .rgb_in  (vout_data_fade),
     .rgb_out (vout_data_osd)
 );
 
@@ -313,7 +362,7 @@ frame_read_write #(
     .read_clk          (video_clk),
     .read_req          (video_read_req),
     .read_req_ack      (video_read_req_ack),
-    .read_finish       (),
+    .read_finish       (read_finish),
     .read_addr_0       (BUF0_ADDR),
     .read_addr_1       (BUF1_ADDR),
     .read_addr_2       (24'd0),
@@ -322,6 +371,17 @@ frame_read_write #(
     .read_len          (FRAME_PIXELS),
     .read_en           (video_read_en),
     .read_data         (video_read_data),
+
+    // ===== 花样转场 =====
+    .trans_en          (trans_en),
+    .trans_effect      (trans_effect),
+    .trans_offset      (trans_offset),
+    .trans_old_base    (trans_old_base),
+    .trans_new_base    (trans_new_base),
+    .dbg_rd_state      (),
+    .dbg_rd_wrbusy     (),
+    .dbg_rd_req2       (),
+    .dbg_rd_init       (),
 
     .App_wr_en         (App_wr_en),
     .App_wr_addr       (App_wr_addr),

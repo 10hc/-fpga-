@@ -232,6 +232,22 @@
                     <Attr Name="CompileOrder" Val="45"/>
                 </FileInfo>
             </File>
+            <File Path="../user_source/hdl_source/trans_ctrl.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="49"/>
+                </FileInfo>
+            </File>
+            <File Path="../user_source/hdl_source/video_fade.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="50"/>
+                </FileInfo>
+            </File>
             <File Path="../user_source/hdl_source/key_toggle.v">
                 <FileInfo>
                     <Attr Name="AutoExcluded" Val="true"/>
