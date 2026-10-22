@@ -153,7 +153,9 @@ end
 sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
     .SCAN_START_SECTOR (32'd0),
-    .SCAN_MAX_SECTOR   (32'd32767),      // 扫描范围 16MB（原 64MB），缩短开机扫描时间
+    .SCAN_MAX_SECTOR   (32'd131071),     // 扫描范围 64MB。注意：不能改小！
+                                         // 大容量卡的 FAT32 元数据可能占满前 16MB，
+                                         // 图片数据会落在 16MB 之后（实测某卡在 16.6MB 处）
     .SCAN_TARGET_COUNT (3'd4)
 ) sd_card_bmp_m0(
     .clk               (sd_card_clk),
