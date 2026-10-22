@@ -301,21 +301,14 @@ end
 
 wire [23:0] vout_data_adj;
 video_adjust u_video_adjust(
-    .de          (de),
-    .sw_bright   (bright_sel),
-    .sw_contrast (contrast_sel),
-    .rgb_in      (vout_data),
-    .rgb_out     (vout_data_adj)
-);
-
-wire [23:0] vout_data_fade;
-video_fade u_video_fade(
     .clk         (video_clk),
     .rst         (rst_all),
     .de          (de),
-    .fade_factor (fade_factor),
-    .rgb_in      (vout_data_adj),
-    .rgb_out     (vout_data_fade)
+    .sw_bright   (bright_sel),
+    .sw_contrast (contrast_sel),
+    .fade        (fade_factor),      // 淡入淡出已折叠进本模块（像素路径仅 1 个乘法器）
+    .rgb_in      (vout_data),
+    .rgb_out     (vout_data_adj)
 );
 
 wire osd_on = 1'b1;   // OSD 文字常开
@@ -327,7 +320,7 @@ osd_overlay u_osd_overlay(
     .de      (de),
     .vs      (vs),
     .osd_en  (osd_on),
-    .rgb_in  (vout_data_fade),
+    .rgb_in  (vout_data_adj),
     .rgb_out (vout_data_osd)
 );
 
