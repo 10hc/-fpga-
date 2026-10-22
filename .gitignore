@@ -1,0 +1,35 @@
+# ===== Anlogic TD 编译产物（自动生成，不入库）=====
+*_Runs/
+log/
+
+# ===== 临时 / 锁文件 =====
+.lock.f
+.recent_user_depot.ini
+.temp.f
+.opt_*.f
+.read_design.*.f
+
+# ===== TD 日志与中间产物 =====
+td_*.log
+td_*.logw
+*.qor
+*.area
+*_gate.db
+
+# ===== 仿真 / 调试产物 =====
+work/
+*.wlf
+transcript
+sim_log.txt
+
+# ===== 崩溃转储 =====
+minidump-*.dmp
+
+# ===== 系统 / 通用 =====
+.DS_Store
+Thumbs.db
+*.bak
+# ===== 大体积媒体（不入库）=====
+演示视频/
+*.mp4
+*.mif.dath
