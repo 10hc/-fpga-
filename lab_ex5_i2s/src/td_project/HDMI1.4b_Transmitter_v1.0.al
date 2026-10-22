@@ -240,24 +240,6 @@
                     <Attr Name="CompileOrder" Val="49"/>
                 </FileInfo>
             </File>
-            <File Path="../user_source/hdl_source/video_fade.v">
-                <FileInfo>
-                    <Attr Name="AutoExcluded" Val="true"/>
-                    <Attr Name="UsedInSyn" Val="true"/>
-                    <Attr Name="UsedInP&R" Val="true"/>
-                    <Attr Name="BelongTo" Val="design_1"/>
-                    <Attr Name="CompileOrder" Val="50"/>
-                </FileInfo>
-            </File>
-            <File Path="../user_source/hdl_source/key_toggle.v">
-                <FileInfo>
-                    <Attr Name="AutoExcluded" Val="true"/>
-                    <Attr Name="UsedInSyn" Val="true"/>
-                    <Attr Name="UsedInP&R" Val="true"/>
-                    <Attr Name="BelongTo" Val="design_1"/>
-                    <Attr Name="CompileOrder" Val="46"/>
-                </FileInfo>
-            </File>
             <File Path="al_ip/font_rom.v">
                 <FileInfo>
                     <Attr Name="UsedInSyn" Val="true"/>
