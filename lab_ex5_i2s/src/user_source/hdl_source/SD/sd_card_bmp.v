@@ -25,12 +25,26 @@ module sd_card_bmp #(
     output                      SD_nCS,
     output                      SD_DCLK,
     output                      SD_MOSI,
-    input                       SD_MISO
+    input                       SD_MISO,
+
+    // ===== WAV 播放器的扇区读通道（与图像请求仲裁：图像优先）=====
+    input                       wav_sec_read,
+    input  [31:0]               wav_sec_read_addr,
+    output [7:0]                wav_sec_read_data,
+    output                      wav_sec_read_data_valid,
+    output                      wav_sec_read_end
 );
 
 wire key_next_press;
 wire key_auto_press;
 
+// 图像（bmp_read）的读请求
+wire             bmp_sec_read;
+wire [31:0]      bmp_sec_read_addr;
+wire [7:0]       bmp_sec_read_data;
+wire             bmp_sec_read_data_valid;
+wire             bmp_sec_read_end;
+// 仲裁后送给 SD 控制器
 wire             sd_sec_read;
 wire [31:0]      sd_sec_read_addr;
 wire [7:0]       sd_sec_read_data;
@@ -317,14 +331,46 @@ bmp_read bmp_read_m0(
     .bmp_height             (bmp_height),
     .write_req              (write_req),
     .write_req_ack          (write_req_ack),
-    .sd_sec_read            (sd_sec_read),
-    .sd_sec_read_addr       (sd_sec_read_addr),
-    .sd_sec_read_data       (sd_sec_read_data),
-    .sd_sec_read_data_valid (sd_sec_read_data_valid),
-    .sd_sec_read_end        (sd_sec_read_end),
+    .sd_sec_read            (bmp_sec_read),
+    .sd_sec_read_addr       (bmp_sec_read_addr),
+    .sd_sec_read_data       (bmp_sec_read_data),
+    .sd_sec_read_data_valid (bmp_sec_read_data_valid),
+    .sd_sec_read_end        (bmp_sec_read_end),
     .bmp_data_wr_en         (bmp_data_wr_en),
     .bmp_data               (bmp_data)
 );
+
+// ===================== 扇区读仲裁：图像优先，WAV 用空档 =====================
+// 一次事务 = 请求拉高 → read_end。事务进行中不切换授权，
+// 所以绝不会打断 SD 卡正在执行的命令；图像路径的时序与原来完全一致，
+// 最坏情况是图像请求多等一个 WAV 扇区（约 300us）。
+reg granted_wav;
+reg sec_busy;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        granted_wav <= 1'b0;
+        sec_busy    <= 1'b0;
+    end else begin
+        if (sd_sec_read_end)    sec_busy <= 1'b0;
+        else if (sd_sec_read)   sec_busy <= 1'b1;
+
+        if (!sec_busy)
+            granted_wav <= wav_sec_read & ~bmp_sec_read;
+    end
+end
+
+assign sd_sec_read      = granted_wav ? wav_sec_read      : bmp_sec_read;
+assign sd_sec_read_addr = granted_wav ? wav_sec_read_addr : bmp_sec_read_addr;
+
+// 数据只回送给被授权的一方
+assign bmp_sec_read_data       = sd_sec_read_data;
+assign bmp_sec_read_data_valid = sd_sec_read_data_valid & ~granted_wav;
+assign bmp_sec_read_end        = sd_sec_read_end        & ~granted_wav;
+
+assign wav_sec_read_data       = sd_sec_read_data;
+assign wav_sec_read_data_valid = sd_sec_read_data_valid & granted_wav;
+assign wav_sec_read_end        = sd_sec_read_end        & granted_wav;
 
 sd_card_top sd_card_top_m0(
     .clk                    (clk),

@@ -92,6 +92,20 @@ wire        audio_i2s_dout;
 wire        audio_valid;
 wire [23:0] audio_left_data;
 wire [23:0] audio_right_data;
+// 内部测试音（WAV 未播放时的兜底音源）
+wire        tone_valid;
+wire [23:0] tone_left_data;
+wire [23:0] tone_right_data;
+// TF 卡 WAV 播放
+wire        wav_valid;
+wire [23:0] wav_left_data;
+wire [23:0] wav_right_data;
+wire        wav_playing;
+wire        wav_sec_read;
+wire [31:0] wav_sec_read_addr;
+wire [7:0]  wav_sec_read_data;
+wire        wav_sec_read_data_valid;
+wire        wav_sec_read_end;
 wire        acr_valid;
 wire [19:0] acr_cts;
 wire [19:0] acr_n;
@@ -178,7 +192,14 @@ sd_card_bmp #(
     .SD_nCS            (sd_ncs),
     .SD_DCLK           (sd_dclk),
     .SD_MOSI           (sd_mosi),
-    .SD_MISO           (sd_miso)
+    .SD_MISO           (sd_miso),
+
+    // ===== 音频：WAV 播放器的扇区读通道（内部与图像请求仲裁，图像优先）=====
+    .wav_sec_read            (wav_sec_read),
+    .wav_sec_read_addr       (wav_sec_read_addr),
+    .wav_sec_read_data       (wav_sec_read_data),
+    .wav_sec_read_data_valid (wav_sec_read_data_valid),
+    .wav_sec_read_end        (wav_sec_read_end)
 );
 
 seg_decoder seg_decoder_m0(
@@ -432,10 +453,36 @@ I2S_receiver u_I2S_receiver(
     .I_i2s_BCLK         (audio_i2s_bclk),
     .I_i2s_LRCK         (audio_i2s_lrck),
     .I_i2s_DOUT         (audio_i2s_dout),
-    .O_audio_valid      (audio_valid),
-    .O_audio_left_data  (audio_left_data),
-    .O_audio_right_data (audio_right_data)
+    .O_audio_valid      (tone_valid),
+    .O_audio_left_data  (tone_left_data),
+    .O_audio_right_data (tone_right_data)
 );
+
+// ===================== 音频源：TF 卡 WAV 优先，找不到则用测试音 =====================
+wav_audio #(
+    .SD_CLK_HZ   (50_000_000),
+    .VID_CLK_HZ  (25_000_000),
+    .SAMPLE_RATE (48_000)
+) u_wav_audio (
+    .sd_clk              (sd_card_clk),
+    .sd_rst              (rst_all),
+    .vid_clk             (video_clk),
+    .vid_rst             (rst_all),
+    .enable              (display_valid),      // 首图显示后，扫描已完成，才去读音频
+    .sec_read            (wav_sec_read),
+    .sec_read_addr       (wav_sec_read_addr),
+    .sec_read_data       (wav_sec_read_data),
+    .sec_read_data_valid (wav_sec_read_data_valid),
+    .sec_read_end        (wav_sec_read_end),
+    .aud_valid           (wav_valid),
+    .aud_left            (wav_left_data),
+    .aud_right           (wav_right_data),
+    .playing             (wav_playing)
+);
+
+assign audio_valid      = wav_playing ? wav_valid      : tone_valid;
+assign audio_left_data  = wav_playing ? wav_left_data  : tone_left_data;
+assign audio_right_data = wav_playing ? wav_right_data : tone_right_data;
 
 audio_arc_calculate #(
     .ACR_N         (6144)
