@@ -9,6 +9,7 @@ module sd_card_bmp #(
     input                       rst,
     input                       key_next,
     input                       key_auto,
+    input                       suspend,       // 视频模式：停掉图片自动播放/加载，别和视频抢带宽
     output [3:0]                state_code,
     output [7:0]                dbg,           // 调试：加载/提交状态，给屏幕方块用
     input  [15:0]               bmp_width,
@@ -297,8 +298,15 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt <= 32'd0;
                 end
 
+                // 视频模式：停掉自动播放并撤掉挂起的切图请求（这些会去抢 SD 读和 SDRAM 写通道）
+                if (suspend) begin
+                    auto_play_en     <= 1'b0;
+                    next_req_pending <= 1'b0;
+                    auto_cnt         <= 32'd0;
+                end
+
                 // 首图自动加载到 buffer0
-                if (scan_done && !first_image_committed && bmp_ready && !load_busy && (img_found_count != 3'd0)) begin
+                if (scan_done && !first_image_committed && bmp_ready && !load_busy && !suspend && (img_found_count != 3'd0)) begin
                     load_idx         <= 2'd0;
                     load_sector      <= img_sector0;
                     pending_buf_idx  <= 2'd0;

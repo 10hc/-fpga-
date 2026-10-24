@@ -273,6 +273,7 @@ sd_card_bmp #(
     .rst               (rst_all),
     .key_next          (key_next_img),
     .key_auto          (key_auto_img),
+    .suspend           (video_mode),
     .state_code        (state_code),
     .dbg               (img_dbg),
     .bmp_width         (16'd640),
@@ -371,7 +372,9 @@ always @(posedge ext_mem_clk or posedge rst_all) begin
         disp_sync2 <= disp_sync1;
     end
 end
-wire switch_pulse = (disp_sync2 != disp_sync1);
+// 视频模式下播放器每帧都交换显示缓冲区，不能当成"切图"去触发转场，
+// 否则画面会被 SLIDE 效果一帧一帧地横向推来推去（上板现象：图片左右抽动）
+wire switch_pulse = (~video_mode) && (disp_sync2 != disp_sync1);
 
 wire        read_finish;
 wire        trans_en;
