@@ -99,11 +99,12 @@ module video_player #(
 
     assign active = enable && (st != S_IDLE);
 
-    // ---------------- 帧率节拍（独立，只碰 pace_cnt）----------------
+    // ---------------- 帧率节拍（唯一驱动 pace_cnt，状态机里不得再赋值）----------------
     always @(posedge clk or posedge rst) begin
-        if (rst) pace_cnt <= 32'd0;
-        else if (st == S_PACE && pace_tick) pace_cnt <= 32'd0;
-        else pace_cnt <= pace_cnt + 32'd1;
+        if (rst)               pace_cnt <= 32'd0;
+        else if (st != S_PACE) pace_cnt <= 32'd0;   // 只有 S_PACE 状态才走计数
+        else if (pace_tick)    pace_cnt <= 32'd0;
+        else                   pace_cnt <= pace_cnt + 32'd1;
     end
 
     // ---------------- wr_finish 同步（独立，只碰 fin_sync）----------------
@@ -295,8 +296,7 @@ module video_player #(
                 if (fin_pulse) begin
                     disp_buf_idx  <= write_buf_idx;            // 切到新帧
                     display_valid <= 1'b1;
-                    pace_cnt      <= 32'd0;
-                    st            <= S_PACE;
+                    st            <= S_PACE;   // pace_cnt 由节拍块在非 S_PACE 时清零
                 end
             end
 
