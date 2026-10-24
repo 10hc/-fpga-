@@ -193,6 +193,7 @@ wire [1:0]  img_disp_buf_idx;
 wire        img_write_req;
 wire        img_write_en;
 wire [31:0] img_write_data;
+wire [7:0]  img_dbg;          // 图像加载/提交状态（给屏幕方块）
 
 // ---- 扇区读通道：sd_card_bmp 的那一对端口 ----
 wire [7:0]  sec_from_bmp_data;
@@ -214,6 +215,7 @@ wire        vid_display_valid;
 wire [1:0]  vid_disp_buf_idx;
 wire [1:0]  vid_write_buf_idx;
 wire        vid_active;
+wire [3:0]  vid_st_dbg;
 
 video_player #(
     .CLK_FREQ_HZ (100_000_000)
@@ -234,7 +236,8 @@ video_player #(
     .display_valid       (vid_display_valid),
     .disp_buf_idx        (vid_disp_buf_idx),
     .write_buf_idx       (vid_write_buf_idx),
-    .active              (vid_active)
+    .active              (vid_active),
+    .st_dbg              (vid_st_dbg)
 );
 
 // ---- 帧写通道与显示控制：视频模式接管，否则用图像路径 ----
@@ -271,6 +274,7 @@ sd_card_bmp #(
     .key_next          (key_next_img),
     .key_auto          (key_auto_img),
     .state_code        (state_code),
+    .dbg               (img_dbg),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
     .display_valid     (img_display_valid),
@@ -418,14 +422,9 @@ always @(posedge video_clk or posedge rst_all) begin
     end
 end
 
-// ===================== 按键诊断：屏幕顶部 8 个方块 =====================
-// 目的：判断"按下按键，FPGA 到底有没有收到"。
-// 从左到右分别对应 key_dbg[7]..key_dbg[0]：
-//   [7] display_valid（图像已就绪）  [6] video_mode（视频模式）
-//   [5] key2(板上KEY_4)短按已检测    [4] key1(板上KEY_2)长按已检测
-//   [3] key1 短按已检测              [2] key3 实时电平（按下=1）
-//   [1] key2 实时电平                [0] key1 实时电平
-// 绿色 = 0，红色 = 1。按住不放时对应方块应变红。
+// ===================== 屏幕顶部 8 个方块（诊断用） =====================
+// 方块含义随模式自动切换，具体见文件末尾 key_dbg 定义处的注释。
+// 绿色 = 0，红色 = 1；从左到右对应 key_dbg[7] .. key_dbg[0]。
 reg k1_lvl, k2_lvl, k3_lvl;
 always @(posedge video_clk or posedge rst_all) begin
     if (rst_all) begin
@@ -462,9 +461,17 @@ always @(posedge video_clk or posedge rst_all) begin
     end
 end
 
-wire [7:0] key_dbg = { display_valid, video_mode,
-                       (h_k4s != 25'd0), (h_k1l != 25'd0), (h_k1s != 25'd0),
-                       ~k3_lvl, ~k2_lvl, ~k1_lvl };
+// 图像模式：看"按下 KEY_2 切图"这条链走到哪一步
+//   [7] display_valid（已有图）   [6] load_busy（正在加载，卡住会一直红）
+//   [5] 源文件读完了在等帧写      [4] 帧写刚完成（亮约 0.3 秒）
+//   [3] 切图请求已挂起            [2] KEY_2 短按已检测
+//   [1] bmp_ready                 [0] scan_done（扫描完成）
+reg [7:0] dbg_sel;
+always @(*) dbg_sel = video_mode
+    ? { vid_display_valid, vid_active, vid_wr_req, sd_card_write_req_ack, vid_st_dbg }
+    : { img_dbg[7], img_dbg[6], img_dbg[5], img_dbg[0],
+        img_dbg[4], (h_k1s != 25'd0), img_dbg[3], img_dbg[2] };
+wire [7:0] key_dbg = dbg_sel;
 
 wire [23:0] vout_data_adj;
 video_adjust u_video_adjust(

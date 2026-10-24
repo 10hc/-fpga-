@@ -10,6 +10,7 @@ module sd_card_bmp #(
     input                       key_next,
     input                       key_auto,
     output [3:0]                state_code,
+    output [7:0]                dbg,           // 调试：加载/提交状态，给屏幕方块用
     input  [15:0]               bmp_width,
     input  [15:0]               bmp_height,
     output reg                  display_valid,
@@ -92,6 +93,28 @@ assign write_data = {bmp_data[23:16], bmp_data[15:8], bmp_data[7:0], 8'b0};
 assign auto_tick  = (auto_cnt == (CLK_FREQ_HZ - 1));
 assign next_from_current = next_index_limited(img_idx, img_found_count);
 assign write_finish_pulse = wrfin_tgl_sync[2] ^ wrfin_tgl_sync[1];
+
+// 帧写完成脉冲的可见指示：拉长到约 0.3 秒，这样屏幕上能直接看到“有帧写完成”
+reg [24:0] wfin_hold;
+always @(posedge clk or posedge rst) begin
+    if (rst)                        wfin_hold <= 25'd0;
+    else if (write_finish_pulse)    wfin_hold <= 25'd30_000_000;
+    else if (wfin_hold != 25'd0)    wfin_hold <= wfin_hold - 25'd1;
+end
+wire write_finish_lat = (wfin_hold != 25'd0);
+
+// 加载看门狗：一次加载超过约 0.5 秒还没提交就强制结束，
+// 否则 load_busy 永远为 1（整帧写完的脉冲万一没来），之后就再也切不了图、视频也永远等不到应答
+reg [26:0] load_wd;
+always @(posedge clk or posedge rst) begin
+    if (rst)                     load_wd <= 27'd0;
+    else if (!load_busy)         load_wd <= 27'd0;
+    else if (load_wd < 27'd50_000_000) load_wd <= load_wd + 27'd1;
+end
+wire load_wd_fire = (load_wd >= 27'd50_000_000);
+
+assign dbg = {display_valid, load_busy, source_done_seen, next_req_pending,
+              bmp_ready, scan_done, first_image_committed, write_finish_lat};
 
 key_press_debounce #(
     .CLK_FREQ_HZ (CLK_FREQ_HZ),
@@ -228,6 +251,12 @@ always @(posedge clk or posedge rst) begin
                 img_idx               <= load_idx;
                 display_valid         <= 1'b1;
                 first_image_committed <= 1'b1;
+            end
+
+            // 看门狗兜底：加载卡死超过 0.5 秒就放弃，保证还能继续切图
+            if (load_busy && load_wd_fire && !(source_done_seen && write_finish_pulse)) begin
+                load_busy        <= 1'b0;
+                source_done_seen <= 1'b0;
             end
 
             // 上电后自动发起一次“扫描前 4 张 BMP”

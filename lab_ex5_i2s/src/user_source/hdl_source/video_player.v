@@ -42,7 +42,8 @@ module video_player #(
     output reg         display_valid,
     output reg  [1:0]  disp_buf_idx,
     output reg  [1:0]  write_buf_idx,
-    output wire        active
+    output wire        active,
+    output wire [3:0]  st_dbg          // 调试：当前状态，给屏幕方块用
 );
 
     // ---------------- 常量 ----------------
@@ -82,6 +83,9 @@ module video_player #(
 
     reg [31:0] pace_cnt;
     reg [2:0]  fin_sync;
+    reg        wr_req_set;      // 状态机发出的“请求一次帧写”脉冲
+    reg        wr_ready;        // 本帧的写请求已被应答，可以送像素了
+    reg [3:0]  ack_dly;         // ack 之后的等待计数
 
     // 分组缓冲（推断 BRAM）
     reg [15:0] gbuf [0:1279];
@@ -113,6 +117,38 @@ module video_player #(
         else     fin_sync <= {fin_sync[1:0], wr_finish};
     end
 
+    assign st_dbg = {1'b0, st};
+
+    // ---------------- 写请求握手（唯一驱动 wr_req / wr_ready）----------------
+    // frame_fifo_write 的协议：写请求必须一直保持到 write_req_ack 到来；
+    // 收到 ack 后必须立刻撤销请求，否则它会停在 S_ACK、而且写 FIFO 一直被异步清零，
+    // 后面送进去的像素会被吃掉，导致 write_finish 永远不来（图像切不过去、视频也出不来）。
+    // 另外 FIFO 的清零是在请求撤销那一拍才解除，所以 ack 之后要再等几拍才允许送数据。
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            wr_req   <= 1'b0;
+            wr_ready <= 1'b0;
+            ack_dly  <= 4'd0;
+        end else if (!enable) begin
+            wr_req   <= 1'b0;
+            wr_ready <= 1'b0;
+            ack_dly  <= 4'd0;
+        end else begin
+            if (wr_req && wr_req_ack) begin
+                wr_req  <= 1'b0;              // 收到应答：立刻撤销（与状态机状态无关）
+                ack_dly <= 4'd12;             // 再等 12 拍，让 FIFO 清零彻底解除
+            end else if (ack_dly != 4'd0) begin
+                ack_dly <= ack_dly - 4'd1;
+                if (ack_dly == 4'd1) wr_ready <= 1'b1;   // 之后才允许送像素
+            end
+            if (wr_req_set) begin             // 状态机请求一次新的帧写
+                wr_req   <= 1'b1;
+                wr_ready <= 1'b0;
+                ack_dly  <= 4'd0;
+            end
+        end
+    end
+
     // ---------------- 主状态机 ----------------
     always @(posedge clk or posedge rst) begin
         if (rst) begin
@@ -135,20 +171,20 @@ module video_player #(
             o_dup         <= 1'b0;
             o_row         <= 1'b0;
             o_div         <= 1'b0;
-            wr_req        <= 1'b0;
+            wr_req_set    <= 1'b0;
             wr_en         <= 1'b0;
             wr_data       <= 32'd0;
             disp_buf_idx  <= 2'd0;
             write_buf_idx <= 2'd0;
             display_valid <= 1'b0;
         end else begin
-            wr_en <= 1'b0;
+            wr_en       <= 1'b0;
+            wr_req_set  <= 1'b0;
 
             case (st)
             // ================= 等使能 =================
             S_IDLE: begin
                 sec_read <= 1'b0;
-                wr_req   <= 1'b0;
                 if (enable) begin
                     addr    <= SCAN_START;
                     hdr_cnt <= 10'd0;
@@ -211,15 +247,13 @@ module video_player #(
                     o_div         <= 1'b0;
                     wr_buf        <= wr_buf + 2'd1;
                     write_buf_idx <= wr_buf + 2'd1;
-                    wr_req        <= 1'b1;
+                    wr_req_set    <= 1'b1;
                     st            <= S_GRP;
                 end
             end
 
             // ================= 收一组（5 扇区 = 1280 像素）=================
             S_GRP: begin
-                if (wr_req && wr_req_ack) wr_req <= 1'b0;
-
                 if (!sec_read) begin
                     sec_read      <= 1'b1;
                     sec_read_addr <= addr;
@@ -256,7 +290,9 @@ module video_player #(
 
             // ================= 输出一组（5120 字）=================
             S_OUT: begin
-                if (o_div == 1'b0) begin
+                if (!wr_ready) begin
+                    // 等写通道应答：FIFO 清零还没解除时送进去的像素会被吃掉
+                end else if (o_div == 1'b0) begin
                     o_div   <= 1'b1;                           // 限速：1 字 / 2 拍
                     wr_en   <= 1'b1;
                     wr_data <= {pix888, 8'b0};
@@ -307,7 +343,7 @@ module video_player #(
                     g_wp    <= 11'd0;
                     wr_buf  <= wr_buf + 2'd1;
                     write_buf_idx <= wr_buf + 2'd1;
-                    wr_req  <= 1'b1;
+                    wr_req_set  <= 1'b1;
                     if (frame_left > 32'd1) frame_left <= frame_left - 32'd1;
                     else                    frame_left <= 32'd0;   // 0 = 循环
                     st      <= S_GRP;
