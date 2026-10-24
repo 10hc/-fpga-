@@ -27,7 +27,7 @@ module osd_overlay #(
     // ==================== 文本表：改这一行即可 ====================
     // 必须恰好 TEXT_LEN(64) 个字符；不足用空格补齐
     localparam [TEXT_LEN*8-1:0] OSD_TEXT =
-        "ANLU 2026  SMART HOME  FPGA 2026                                ";
+        "ANLU 2026  KEYFIX-V25  FPGA 2026                                ";
 
     // ---------- x/y 有效像素坐标跟踪 ----------
     reg [9:0] x, y;
