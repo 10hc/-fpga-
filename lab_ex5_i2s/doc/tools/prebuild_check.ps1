@@ -83,7 +83,9 @@ Write-Host ""
 Write-Host "[2/3] 扫描多驱动（综合会报 ERROR: constantly driven from multiple places）" -ForegroundColor Cyan
 $scan = Join-Path $PSScriptRoot "scan_multi_driver.py"
 if ((Test-Path $scan) -and (Get-Command $Python -ErrorAction SilentlyContinue)) {
-    $out = & $Python $scan $hdlDir $impDir (Join-Path $tdDir "al_ip") 2>&1
+    # test\ 里是仿真用文件（tb_*.v、sim_eg_logic_bram.v 的 BRAM 替身），综合不编译，
+    # 其中双口 RAM 天然"一个 mem 两个 always"，会造成误报，故排除。
+    $out = & $Python $scan --exclude "test" $hdlDir $impDir (Join-Path $tdDir "al_ip") 2>&1
     $out | ForEach-Object { Write-Host ("  " + $_) }
     if (($out | Select-String -Pattern "发现 0 处").Count -eq 0) { $fail++ }
 } else {

@@ -21,6 +21,7 @@ module osd_overlay #(
     input  wire        vs,
     input  wire        osd_en,
     input  wire [23:0] rgb_in,
+    input  wire [7:0]  key_dbg,      // 顶部 8 个诊断方块（1=红 0=绿），不受 osd_en 控制
     output wire [23:0] rgb_out
 );
     // ==================== 文本表：改这一行即可 ====================
@@ -75,27 +76,42 @@ module osd_overlay #(
         .clka  (clk)
     );
 
+    // ---------- 顶部按键诊断方块 ----------
+    // 8 个 16x16 方块，从左到右对应 key_dbg[7]..key_dbg[0]，
+    // 红色 = 1，绿色 = 0。用来判断"按下按键，FPGA 到底有没有收到"。
+    // 方块间距取 16（2 的幂），避免综合出除法器。
+    wire [9:0]  dbg_dx  = x - 10'd8;                     // 0..127
+    wire        in_dbg  = (x >= 10'd8) && (x < 10'd136) &&
+                          (y >= 10'd8) && (y < 10'd24) &&
+                          (dbg_dx[3:0] >= 4'd4);         // 每格右侧留 4 像素缝
+    wire [2:0]  dbg_idx = dbg_dx[6:4];                   // /16 → 0..7，无除法器
+    wire        dbg_val = key_dbg[3'd7 - dbg_idx];       // 左 = bit7
+
     // ---------- 输出流水线（对齐 ROM 1 拍）----------
     reg [23:0] rgb_d;
     reg        de_d, text_d, box_d, osd_d;
+    reg        dbg_d, dbg_val_d;
     reg [2:0]  col_d;
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             rgb_d <= 24'd0; de_d <= 1'b0; text_d <= 1'b0; box_d <= 1'b0;
-            osd_d <= 1'b0; col_d <= 3'd0;
+            osd_d <= 1'b0; col_d <= 3'd0; dbg_d <= 1'b0; dbg_val_d <= 1'b0;
         end else begin
-            rgb_d  <= rgb_in;
-            de_d   <= de;
-            text_d <= inside_text;
-            box_d  <= inside_box;
-            osd_d  <= osd_en;
-            col_d  <= char_col;
+            rgb_d     <= rgb_in;
+            de_d      <= de;
+            text_d    <= inside_text;
+            box_d     <= inside_box;
+            osd_d     <= osd_en;
+            col_d     <= char_col;
+            dbg_d     <= in_dbg;
+            dbg_val_d <= dbg_val;
         end
     end
 
     wire glyph_on = glyph_byte[7 - col_d];
 
-    assign rgb_out = (osd_d && de_d && text_d && glyph_on) ? 24'hFFFFFF :
-                     (osd_d && de_d && box_d)              ? 24'h000000 :
-                                                             rgb_d;
+    assign rgb_out = (de_d && dbg_d)                              ? (dbg_val_d ? 24'hFF0000 : 24'h00FF00) :
+                     (osd_d && de_d && text_d && glyph_on)        ? 24'hFFFFFF :
+                     (osd_d && de_d && box_d)                     ? 24'h000000 :
+                                                                    rgb_d;
 endmodule

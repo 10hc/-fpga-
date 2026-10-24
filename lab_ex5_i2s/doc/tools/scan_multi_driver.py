@@ -110,7 +110,7 @@ def scan_file(path):
     return out, len(mods)
 
 
-def walk(targets):
+def walk(targets, excludes=()):
     files = []
     for t in targets:
         p = Path(t)
@@ -118,15 +118,24 @@ def walk(targets):
             files.extend(sorted(p.rglob('*.v')))
         elif p.suffix.lower() == '.v':
             files.append(p)
+    if excludes:
+        files = [f for f in files
+                 if not any(x and x in str(f) for x in excludes)]
     return files
 
 
 def main():
-    targets = sys.argv[1:]
+    args = sys.argv[1:]
+    excludes, targets = [], []
+    i = 0
+    while i < len(args):
+        if args[i] == '--exclude' and i + 1 < len(args):
+            excludes.append(args[i + 1]); i += 2; continue
+        targets.append(args[i]); i += 1
     if not targets:
-        print('用法: python scan_multi_driver.py <目录或文件> [...]')
+        print('用法: python scan_multi_driver.py [--exclude 子串] <目录或文件> [...]')
         return 1
-    files = walk(targets)
+    files = walk(targets, excludes)
     nprob = nmods = 0
     for f in files:
         probs, nm = scan_file(f)

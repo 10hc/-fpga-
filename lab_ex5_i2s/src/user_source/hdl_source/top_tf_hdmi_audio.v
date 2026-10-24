@@ -416,6 +416,54 @@ always @(posedge video_clk or posedge rst_all) begin
     end
 end
 
+// ===================== 按键诊断：屏幕顶部 8 个方块 =====================
+// 目的：判断"按下按键，FPGA 到底有没有收到"。
+// 从左到右分别对应 key_dbg[7]..key_dbg[0]：
+//   [7] display_valid（图像已就绪）  [6] video_mode（视频模式）
+//   [5] key2(板上KEY_4)短按已检测    [4] key1(板上KEY_2)长按已检测
+//   [3] key1 短按已检测              [2] key3 实时电平（按下=1）
+//   [1] key2 实时电平                [0] key1 实时电平
+// 绿色 = 0，红色 = 1。按住不放时对应方块应变红。
+reg k1_lvl, k2_lvl, k3_lvl;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        k1_lvl <= 1'b1; k2_lvl <= 1'b1; k3_lvl <= 1'b1;
+    end else begin
+        k1_lvl <= key1; k2_lvl <= key2; k3_lvl <= key3;
+    end
+end
+
+// key2（板上 KEY_4）原本直接给图像路径，这里额外加一个检测器用于显示
+wire k4_short, k4_long;
+key_short_long #(
+    .CLK_FREQ_HZ (25_000_000),
+    .LONG_MS     (1000)
+) u_key4_det (
+    .clk         (video_clk),
+    .rst         (rst_all),
+    .button      (key2),
+    .short_pulse (k4_short),
+    .long_pulse  (k4_long)
+);
+
+// 事件保持约 0.75 秒（25MHz × 0.75s = 18_750_000 拍），肉眼可见
+localparam [24:0] DBG_HOLD = 25'd18_750_000;
+reg [24:0] h_k1s, h_k1l, h_k4s, h_k4l;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        h_k1s <= 25'd0; h_k1l <= 25'd0; h_k4s <= 25'd0; h_k4l <= 25'd0;
+    end else begin
+        h_k1s <= k2_short  ? DBG_HOLD : (h_k1s != 25'd0 ? h_k1s - 25'd1 : 25'd0);
+        h_k1l <= k2_long   ? DBG_HOLD : (h_k1l != 25'd0 ? h_k1l - 25'd1 : 25'd0);
+        h_k4s <= k4_short  ? DBG_HOLD : (h_k4s != 25'd0 ? h_k4s - 25'd1 : 25'd0);
+        h_k4l <= k4_long   ? DBG_HOLD : (h_k4l != 25'd0 ? h_k4l - 25'd1 : 25'd0);
+    end
+end
+
+wire [7:0] key_dbg = { display_valid, video_mode,
+                       (h_k4s != 25'd0), (h_k1l != 25'd0), (h_k1s != 25'd0),
+                       ~k3_lvl, ~k2_lvl, ~k1_lvl };
+
 wire [23:0] vout_data_adj;
 video_adjust u_video_adjust(
     .clk         (video_clk),
@@ -438,6 +486,7 @@ osd_overlay u_osd_overlay(
     .vs      (vs),
     .osd_en  (osd_on),
     .rgb_in  (vout_data_adj),
+    .key_dbg (key_dbg),
     .rgb_out (vout_data_osd)
 );
 
