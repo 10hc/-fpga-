@@ -164,9 +164,11 @@ def main():
         f.write(head)
         for n in range(total):
             img = scene.frame(n, total, args.fps)
-            f.write(to_rgb565(img))
             if args.preview and n == total // 3:
-                img.save(args.preview)
+                img.save(args.preview)          # 预览按屏幕看到的正立方向保存
+            # FPGA 写入通开着 WRITE_V_FLIP（为纠正 BMP 自下而上的行序），
+            # 所以 .VID 每帧必须预先上下镜像，上板才是正的
+            f.write(to_rgb565(img.transpose(Image.FLIP_TOP_BOTTOM)))
             if (n + 1) % 25 == 0:
                 print(f"  已生成 {n+1}/{total} 帧")
 
