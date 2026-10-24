@@ -81,6 +81,8 @@ reg              load_busy;
 
 // bmp_ready 先表示“源文件读取/送 FIFO 完成”；真正切显示要等 write_finish_toggle 同步后
 reg              source_done_seen;
+// 整帧写完事件：与 source_done_seen 谁先到都先记住，两个都到齐才提交（避免先后顺序问题）
+reg              write_done_seen;
 
 // 同步 mem_clk 域的 write_finish_toggle
 reg [2:0]        wrfin_tgl_sync;
@@ -104,18 +106,24 @@ always @(posedge clk or posedge rst) begin
 end
 wire write_finish_lat = (wfin_hold != 25'd0);
 
-// 加载看门狗：一次加载超过约 0.5 秒还没提交就强制结束，
-// 否则 load_busy 永远为 1（整帧写完的脉冲万一没来），之后就再也切不了图、视频也永远等不到应答
-reg [26:0] load_wd;
+// 加载看门狗：一次加载超过 2 秒还没提交就强制结束。
+// 注意：一帧 921KB 在 25MHz SPI 下约需 0.25~0.5 秒，原来的 0.5 秒会把正常加载误判成卡死，
+// 于是每次都在“差最后一点”时被放弃 → 图片永远提交不了（这曾经导致完全不出图）
+localparam [31:0] LOAD_WD_CYCLES = 32'd200_000_000;   // 2 秒 @100MHz
+reg [31:0] load_wd;
 always @(posedge clk or posedge rst) begin
-    if (rst)                     load_wd <= 27'd0;
-    else if (!load_busy)         load_wd <= 27'd0;
-    else if (load_wd < 27'd50_000_000) load_wd <= load_wd + 27'd1;
+    if (rst)                           load_wd <= 32'd0;
+    else if (!load_busy)               load_wd <= 32'd0;
+    else if (load_wd < LOAD_WD_CYCLES) load_wd <= load_wd + 32'd1;
 end
-wire load_wd_fire = (load_wd >= 27'd50_000_000);
+wire load_wd_fire = (load_wd >= LOAD_WD_CYCLES);
 
-assign dbg = {display_valid, load_busy, source_done_seen, next_req_pending,
-              bmp_ready, scan_done, first_image_committed, write_finish_lat};
+// 屏幕方块诊断（与顶层注释一一对应）：
+// [7]display_valid [6]load_busy [5]source_done_seen [4]write_done_seen
+// [3]scan_done [2]找到>=1张 [1]找到>=2张 [0]找到>=3张
+assign dbg = {display_valid, load_busy, source_done_seen, write_done_seen,
+              scan_done,
+              (img_found_count >= 3'd1), (img_found_count >= 3'd2), (img_found_count >= 3'd3)};
 
 key_press_debounce #(
     .CLK_FREQ_HZ (CLK_FREQ_HZ),
@@ -200,6 +208,7 @@ always @(posedge clk or posedge rst) begin
         next_req_pending      <= 1'b0;
         load_busy             <= 1'b0;
         source_done_seen      <= 1'b0;
+        write_done_seen       <= 1'b0;
         display_valid         <= 1'b0;
     end else begin
         wrfin_tgl_sync   <= {wrfin_tgl_sync[1:0], write_finish_toggle};
@@ -224,6 +233,7 @@ always @(posedge clk or posedge rst) begin
             next_req_pending      <= 1'b0;
             load_busy             <= 1'b0;
             source_done_seen      <= 1'b0;
+            write_done_seen       <= 1'b0;
             display_valid         <= 1'b0;
         end else begin
             // 扫描阶段缓存前 4 张图的起始 sector
@@ -240,24 +250,38 @@ always @(posedge clk or posedge rst) begin
                     img_found_count <= img_found_count + 3'd1;
             end
 
-            // 记住 bmp_read 已经把源图送完 FIFO，但还不能切显示，得等整帧写完
+            // 记住两个“完成”事件：源文件送完 FIFO、整帧写完 SDRAM。
+            // 谁先到都先记住，不再要求“同一时刻同时成立”（那是原来不出图的第二个原因）
             if (load_busy && bmp_ready)
                 source_done_seen <= 1'b1;
 
-            // 只有真正收到 write_finish_toggle 脉冲，才提交新图并切换显示缓冲区
-            if (load_busy && source_done_seen && write_finish_pulse) begin
+            if (load_busy && write_finish_pulse)
+                write_done_seen  <= 1'b1;
+
+            // 两个事件都到齐，才提交新图并切换显示缓冲区
+            if (load_busy && source_done_seen && write_done_seen) begin
                 load_busy             <= 1'b0;
                 source_done_seen      <= 1'b0;
+                write_done_seen       <= 1'b0;
                 disp_buf_idx          <= pending_buf_idx;
                 img_idx               <= load_idx;
                 display_valid         <= 1'b1;
                 first_image_committed <= 1'b1;
             end
 
-            // 看门狗兜底：加载卡死超过 0.5 秒就放弃，保证还能继续切图
-            if (load_busy && load_wd_fire && !(source_done_seen && write_finish_pulse)) begin
+            // 看门狗兜底：超过 2 秒仍未提交就结束本次加载。
+            // 若源文件其实已经送完（数据早已写进 SDRAM），直接提交，避免“永远没有图”
+            if (load_busy && load_wd_fire && !(source_done_seen && write_done_seen)) begin
                 load_busy        <= 1'b0;
                 source_done_seen <= 1'b0;
+                    write_done_seen  <= 1'b0;
+                write_done_seen  <= 1'b0;
+                if (source_done_seen) begin
+                    disp_buf_idx          <= pending_buf_idx;
+                    img_idx               <= load_idx;
+                    display_valid         <= 1'b1;
+                    first_image_committed <= 1'b1;
+                end
             end
 
             // 上电后自动发起一次“扫描前 4 张 BMP”
@@ -277,6 +301,7 @@ always @(posedge clk or posedge rst) begin
                 display_valid         <= 1'b0;
                 load_busy             <= 1'b0;
                 source_done_seen      <= 1'b0;
+                write_done_seen       <= 1'b0;
             end else begin
                 // 忙的时候也只记 1 次“下一张”请求，不会累积成连跳两张
                 if (key_next_press && scan_done && (img_found_count > 3'd0))
@@ -314,6 +339,7 @@ always @(posedge clk or posedge rst) begin
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
+                    write_done_seen  <= 1'b0;
                     next_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
@@ -326,6 +352,7 @@ always @(posedge clk or posedge rst) begin
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
+                    write_done_seen  <= 1'b0;
                     next_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
@@ -338,6 +365,7 @@ always @(posedge clk or posedge rst) begin
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
+                    write_done_seen  <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
             end

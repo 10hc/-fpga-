@@ -464,16 +464,18 @@ always @(posedge video_clk or posedge rst_all) begin
     end
 end
 
-// 图像模式：看"按下 KEY_2 切图"这条链走到哪一步
-//   [7] display_valid（已有图）   [6] load_busy（正在加载，卡住会一直红）
-//   [5] 源文件读完了在等帧写      [4] 帧写刚完成（亮约 0.3 秒）
-//   [3] 切图请求已挂起            [2] KEY_2 短按已检测
-//   [1] bmp_ready                 [0] scan_done（扫描完成）
+// 图像模式：看"按下 KEY_2 切图"这条链走到哪一步（方块 1 在最左）
+//   [7] 方块1 display_valid（=1 说明已经有一张图提交成功）
+//   [6] 方块2 load_busy（正在加载；一直红=卡住）
+//   [5] 方块3 source_done_seen（源文件已读完送进 FIFO）
+//   [4] 方块4 write_done_seen（整帧已写进 SDRAM；和方块3 都红后就会提交）
+//   [3] 方块5 scan_done 或 KEY_2 短按已检测
+//   [2] 方块6 找到>=1 张图   [1] 方块7 找到>=2 张   [0] 方块8 找到>=3 张
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     ? { vid_display_valid, vid_active, vid_wr_req, sd_card_write_req_ack, vid_st_dbg }
-    : { img_dbg[7], img_dbg[6], img_dbg[5], img_dbg[0],
-        img_dbg[4], (h_k1s != 25'd0), img_dbg[3], img_dbg[2] };
+    : { img_dbg[7], img_dbg[6], img_dbg[5], img_dbg[4],
+        (img_dbg[3] | (h_k1s != 25'd0)), img_dbg[2], img_dbg[1], img_dbg[0] };
 wire [7:0] key_dbg = dbg_sel;
 
 wire [23:0] vout_data_adj;
