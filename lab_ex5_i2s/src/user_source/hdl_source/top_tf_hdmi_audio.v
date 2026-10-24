@@ -376,6 +376,12 @@ end
 // 否则画面会被 SLIDE 效果一帧一帧地横向推来推去（上板现象：图片左右抽动）
 wire switch_pulse = (~video_mode) && (disp_sync2 != disp_sync1);
 
+// 【重要】转场特效暂时关闭：读地址走转场逻辑时，切图后整屏会变成灰黑乱码
+// （已用仿真确认转场地址序列本身正确，问题在参数/回收时序，需要专门再调）。
+// 关掉后切图就是干净的缓冲区切换。等基础显示彻底稳定后把这里改回 1'b1 再继续调特效。
+localparam TRANS_EFFECT_ENABLE = 1'b0;
+wire trans_switch_pulse = TRANS_EFFECT_ENABLE ? switch_pulse : 1'b0;
+
 wire        read_finish;
 wire        trans_en;
 wire [1:0]  trans_effect;
@@ -387,7 +393,7 @@ wire [8:0]  fade_factor;
 trans_ctrl u_trans_ctrl(
     .clk          (ext_mem_clk),
     .rst          (rst_all),
-    .switch_pulse (switch_pulse),
+    .switch_pulse (trans_switch_pulse),
     .frame_done   (read_finish),
     .trans_effect (trans_effect),
     .trans_en     (trans_en),

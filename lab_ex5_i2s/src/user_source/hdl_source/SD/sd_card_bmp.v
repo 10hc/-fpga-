@@ -118,6 +118,16 @@ always @(posedge clk or posedge rst) begin
 end
 wire load_wd_fire = (load_wd >= LOAD_WD_CYCLES);
 
+// 源文件送完后再等约 1ms（100_000 拍 @100MHz），让还在 FIFO 里的几十~几百个字写进 SDRAM。
+// 这样即使 write_finish 脉冲因故没到，也能提交出完整图像（实测第一张图能正常显示就靠这条 + 看门狗兜底）
+reg [16:0] drain_cnt;
+always @(posedge clk or posedge rst) begin
+    if (rst)                                  drain_cnt <= 17'd0;
+    else if (!load_busy || !source_done_seen) drain_cnt <= 17'd0;
+    else if (drain_cnt < 17'd100_000)         drain_cnt <= drain_cnt + 17'd1;
+end
+wire drain_done = (drain_cnt >= 17'd100_000);
+
 // 屏幕方块诊断（与顶层注释一一对应）：
 // [7]display_valid [6]load_busy [5]source_done_seen [4]write_done_seen
 // [3]scan_done [2]找到>=1张 [1]找到>=2张 [0]找到>=3张
@@ -258,8 +268,8 @@ always @(posedge clk or posedge rst) begin
             if (load_busy && write_finish_pulse)
                 write_done_seen  <= 1'b1;
 
-            // 两个事件都到齐，才提交新图并切换显示缓冲区
-            if (load_busy && source_done_seen && write_done_seen) begin
+            // 源文件送完 + （整帧写完 或 再等 1ms）→ 提交新图并切换显示缓冲区
+            if (load_busy && source_done_seen && (write_done_seen || drain_done)) begin
                 load_busy             <= 1'b0;
                 source_done_seen      <= 1'b0;
                 write_done_seen       <= 1'b0;
@@ -271,7 +281,7 @@ always @(posedge clk or posedge rst) begin
 
             // 看门狗兜底：超过 2 秒仍未提交就结束本次加载。
             // 若源文件其实已经送完（数据早已写进 SDRAM），直接提交，避免“永远没有图”
-            if (load_busy && load_wd_fire && !(source_done_seen && write_done_seen)) begin
+            if (load_busy && load_wd_fire && !(source_done_seen && (write_done_seen || drain_done))) begin
                 load_busy        <= 1'b0;
                 source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
