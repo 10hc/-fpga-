@@ -10,8 +10,11 @@ module sd_card_bmp #(
     input                       key_next,
     input                       key_auto,
     input                       suspend,       // 视频模式：停掉图片自动播放/加载，别和视频抢带宽
+    input                       single_buf,    // 诊断：单缓冲测试（新图写进当前正在显示的缓冲，用来分辨“写坏了”还是“切缓冲坏了”）
     output [3:0]                state_code,
     output [7:0]                dbg,           // 调试：加载/提交状态，给屏幕方块用
+    output                      load_busy_o,   // 调试：正在加载一张图
+    output                      wd_seen,       // 调试：加载超时被看门狗中止过
     input  [15:0]               bmp_width,
     input  [15:0]               bmp_height,
     output reg                  display_valid,
@@ -84,6 +87,11 @@ reg              source_done_seen;
 // 整帧写完事件：与 source_done_seen 谁先到都先记住，两个都到齐才提交（避免先后顺序问题）
 reg              write_done_seen;
 
+// 看门狗触发过的锁存（屏幕上用方块指示）：加载超时会被“中止”，不再拿没写完的缓冲区去显示
+reg              wd_seen_r;
+// single_buf 在 video_clk 域由 KEY3 长按切换，跨到 sd 时钟域用两级同步
+reg [1:0]        single_buf_sync;
+
 // 同步 mem_clk 域的 write_finish_toggle
 reg [2:0]        wrfin_tgl_sync;
 wire             write_finish_pulse;
@@ -97,6 +105,17 @@ assign auto_tick  = (auto_cnt == (CLK_FREQ_HZ - 1));
 assign next_from_current = next_index_limited(img_idx, img_found_count);
 assign write_finish_pulse = wrfin_tgl_sync[2] ^ wrfin_tgl_sync[1];
 
+// 给顶层的诊断输出
+assign load_busy_o = load_busy;
+assign wd_seen     = wd_seen_r;
+
+// KEY3 长按切换的“单缓冲测试模式”同步
+wire single_buf_s = single_buf_sync[1];
+always @(posedge clk or posedge rst) begin
+    if (rst) single_buf_sync <= 2'b00;
+    else     single_buf_sync <= {single_buf_sync[0], single_buf};
+end
+
 // 帧写完成脉冲的可见指示：拉长到约 0.3 秒，这样屏幕上能直接看到“有帧写完成”
 reg [24:0] wfin_hold;
 always @(posedge clk or posedge rst) begin
@@ -109,7 +128,7 @@ wire write_finish_lat = (wfin_hold != 25'd0);
 // 加载看门狗：一次加载超过 2 秒还没提交就强制结束。
 // 注意：一帧 921KB 在 25MHz SPI 下约需 0.25~0.5 秒，原来的 0.5 秒会把正常加载误判成卡死，
 // 于是每次都在“差最后一点”时被放弃 → 图片永远提交不了（这曾经导致完全不出图）
-localparam [31:0] LOAD_WD_CYCLES = 32'd200_000_000;   // 2 秒 @100MHz
+localparam [31:0] LOAD_WD_CYCLES = 32'd1_000_000_000;   // 10 秒 @100MHz（加载期间音频已让路，正常 <1 秒）
 reg [31:0] load_wd;
 always @(posedge clk or posedge rst) begin
     if (rst)                           load_wd <= 32'd0;
@@ -217,6 +236,7 @@ always @(posedge clk or posedge rst) begin
         source_done_seen      <= 1'b0;
         write_done_seen       <= 1'b0;
         display_valid         <= 1'b0;
+        wd_seen_r             <= 1'b0;
     end else begin
         wrfin_tgl_sync   <= {wrfin_tgl_sync[1:0], write_finish_toggle};
         scan_start_pulse <= 1'b0;
@@ -242,6 +262,7 @@ always @(posedge clk or posedge rst) begin
             source_done_seen      <= 1'b0;
             write_done_seen       <= 1'b0;
             display_valid         <= 1'b0;
+            wd_seen_r             <= 1'b0;
         end else begin
             // 扫描阶段缓存前 4 张图的起始 sector
             if (scan_found_valid) begin
@@ -278,18 +299,14 @@ always @(posedge clk or posedge rst) begin
                 first_image_committed <= 1'b1;
             end
 
-            // 看门狗兜底：超过 2 秒仍未提交就结束本次加载。
-            // 若源文件其实已经送完（数据早已写进 SDRAM），直接提交，避免“永远没有图”
+            // 看门狗兜底：加载超时（正常 <1 秒，超时说明真卡住了）。
+            // 【重要修正】超时只“中止加载”，绝不提交：原来超时会强行 commit，
+            // 把一块根本没写完的 SDRAM 区当图片显示 → 屏幕上就是彩色乱码/条纹。
             if (load_busy && load_wd_fire && !(source_done_seen && write_done_seen)) begin
                 load_busy        <= 1'b0;
                 source_done_seen <= 1'b0;
                 write_done_seen  <= 1'b0;
-                if (source_done_seen) begin
-                    disp_buf_idx          <= pending_buf_idx;
-                    img_idx               <= load_idx;
-                    display_valid         <= 1'b1;
-                    first_image_committed <= 1'b1;
-                end
+                wd_seen_r        <= 1'b1;
             end
 
             // 上电后自动发起一次“扫描前 4 张 BMP”
@@ -310,6 +327,7 @@ always @(posedge clk or posedge rst) begin
                 load_busy             <= 1'b0;
                 source_done_seen      <= 1'b0;
                 write_done_seen       <= 1'b0;
+                wd_seen_r             <= 1'b0;
             end else begin
                 // 忙的时候也只记 1 次“下一张”请求，不会累积成连跳两张
                 if (key_next_press && scan_done && (img_found_count > 3'd0))
@@ -348,6 +366,7 @@ always @(posedge clk or posedge rst) begin
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
+                    wd_seen_r        <= 1'b0;
                     next_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
@@ -355,12 +374,13 @@ always @(posedge clk or posedge rst) begin
                 else if (scan_done && bmp_ready && display_valid && !load_busy && next_req_pending && (img_found_count != 3'd0)) begin
                     load_idx         <= next_from_current;
                     load_sector      <= sector_lut(next_from_current);
-                    pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
-                    write_buf_idx    <= next_buf_lut(disp_buf_idx, display_valid);
+                    pending_buf_idx  <= single_buf_s ? 2'd0 : next_buf_lut(disp_buf_idx, display_valid);
+                    write_buf_idx    <= single_buf_s ? 2'd0 : next_buf_lut(disp_buf_idx, display_valid);
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
+                    wd_seen_r        <= 1'b0;
                     next_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
@@ -368,12 +388,13 @@ always @(posedge clk or posedge rst) begin
                 else if (scan_done && bmp_ready && display_valid && !load_busy && auto_play_en && auto_tick && (img_found_count > 3'd1)) begin
                     load_idx         <= next_from_current;
                     load_sector      <= sector_lut(next_from_current);
-                    pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
-                    write_buf_idx    <= next_buf_lut(disp_buf_idx, display_valid);
+                    pending_buf_idx  <= single_buf_s ? 2'd0 : next_buf_lut(disp_buf_idx, display_valid);
+                    write_buf_idx    <= single_buf_s ? 2'd0 : next_buf_lut(disp_buf_idx, display_valid);
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
+                    wd_seen_r        <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
             end

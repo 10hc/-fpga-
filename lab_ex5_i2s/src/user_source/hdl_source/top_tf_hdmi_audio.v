@@ -194,6 +194,14 @@ wire        img_write_req;
 wire        img_write_en;
 wire [31:0] img_write_data;
 wire [7:0]  img_dbg;          // 图像加载/提交状态（给屏幕方块）
+wire        img_load_busy;    // 正在加载一张图（音频此时让出 SD 总线）
+wire        img_wd_seen;      // 加载超时被看门狗中止过（诊断方块）
+
+// 诊断开关：KEY3 长按切换“单缓冲测试模式”
+// 单缓冲 = 新图写进当前正在显示的那块 SDRAM 缓冲：
+//   若此时屏幕能正常出现新图 → 说明写通道+图像数据都是好的，问题在缓冲切换；
+//   若仍然乱码 → 说明写进去的数据本身就是坏的。
+reg single_buf_diag;
 
 // ---- 扇区读通道：sd_card_bmp 的那一对端口 ----
 wire [7:0]  sec_from_bmp_data;
@@ -274,8 +282,11 @@ sd_card_bmp #(
     .key_next          (key_next_img),
     .key_auto          (key_auto_img),
     .suspend           (video_mode),
+    .single_buf        (single_buf_diag),
     .state_code        (state_code),
     .dbg               (img_dbg),
+    .load_busy_o       (img_load_busy),
+    .wd_seen           (img_wd_seen),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
     .display_valid     (img_display_valid),
@@ -431,6 +442,12 @@ always @(posedge video_clk or posedge rst_all) begin
     end
 end
 
+// KEY3 长按同时切换“单缓冲测试模式”（诊断开关；对比度会跟着循环，先不管）
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all)      single_buf_diag <= 1'b0;
+    else if (k3_long) single_buf_diag <= ~single_buf_diag;
+end
+
 // ===================== 屏幕顶部 8 个方块（诊断用） =====================
 // 方块含义随模式自动切换，具体见文件末尾 key_dbg 定义处的注释。
 // 绿色 = 0，红色 = 1；从左到右对应 key_dbg[7] .. key_dbg[0]。
@@ -479,9 +496,12 @@ end
 //   [2] 方块6 找到>=1 张图   [1] 方块7 找到>=2 张   [0] 方块8 找到>=3 张
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
-    ? { vid_display_valid, vid_active, vid_wr_req, sd_card_write_req_ack, vid_st_dbg }
-    : { img_dbg[7], img_dbg[6], img_dbg[5], img_dbg[4],
-        (img_dbg[3] | (h_k1s != 25'd0)), img_dbg[2], img_dbg[1], img_dbg[0] };
+    // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
+    ? { vid_display_valid, vid_active, vid_wr_req, 1'b1, 1'b0, 1'b1, 1'b0, 1'b1 }
+    // 图像模式：方块1=单缓冲诊断模式，方块2=display_valid，方块3=load_busy，
+    //           方块4=看门狗中止过，方块5=write_done_seen，方块6~8=bmp_read 状态码
+    : { single_buf_diag, img_dbg[7], img_load_busy, img_wd_seen, img_dbg[4],
+        state_code[2:0] };
 wire [7:0] key_dbg = dbg_sel;
 
 wire [23:0] vout_data_adj;
@@ -633,7 +653,7 @@ wav_audio #(
     .sd_rst              (rst_all),
     .vid_clk             (video_clk),
     .vid_rst             (rst_all),
-    .enable              (display_valid & ~video_mode),   // 视频模式时音频让路
+    .enable              (display_valid & ~video_mode & ~img_load_busy),  // 视频模式/加载图片时音频让路
     .sec_read            (wav_sec_read),
     .sec_read_addr       (wav_sec_read_addr),
     .sec_read_data       (wav_sec_read_data),
