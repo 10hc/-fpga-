@@ -459,23 +459,36 @@ bmp_read bmp_read_m0(
     .bmp_data               (bmp_data)
 );
 
-// ===================== 扇区读仲裁：图像优先，WAV 用空档 =====================
-// 一次事务 = 请求拉高 → read_end。事务进行中不切换授权，
-// 所以绝不会打断 SD 卡正在执行的命令；图像路径的时序与原来完全一致，
-// 最坏情况是图像请求多等一个 WAV 扇区（约 300us）。
+// ===================== 扇区读仲裁：配额轮转（图像 2 : 音频 1）=====================
+// ① 一次事务 = 授权那一刻就锁住 sec_busy，直到 read_end 才放开。
+//    地址/数据/授权三者始终属于同一个主 —— 不会出现“音频以为轮到自己、
+//    结果收到图像扇区字节”的串台（串台听起来就是噪音）。
+// ② 保证音频带宽：图像连拿 2 个扇区后必须让 1 个给音频。
+//    WAV 播放只要 192KB/s，而图像连续读约 1.3ms/扇区，让 1/3 完全喂得饱；
+//    图像侧代价：每 3 个扇区多等约 300us，一张图总时长只多约 15%。
 reg granted_wav;
 reg sec_busy;
+reg [3:0] bmp_streak;               // 图像连续拿到的扇区数
+localparam [3:0] WAV_QUOTA = 4'd2;  // 图像连拿 2 个后必须让 1 个给音频
 
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         granted_wav <= 1'b0;
         sec_busy    <= 1'b0;
-    end else begin
-        if (sd_sec_read_end)    sec_busy <= 1'b0;
-        else if (sd_sec_read)   sec_busy <= 1'b1;
-
-        if (!sec_busy)
-            granted_wav <= wav_sec_read & ~bmp_sec_read;
+        bmp_streak  <= 4'd0;
+    end else if (!sec_busy) begin
+        // 总线空闲：一拍内决定下一个事务归谁，并立刻置 busy 锁死
+        if (wav_sec_read && (bmp_streak >= WAV_QUOTA || !bmp_sec_read)) begin
+            granted_wav <= 1'b1;
+            bmp_streak  <= 4'd0;
+            sec_busy    <= 1'b1;
+        end else if (bmp_sec_read) begin
+            granted_wav <= 1'b0;
+            bmp_streak  <= (bmp_streak >= WAV_QUOTA) ? WAV_QUOTA : (bmp_streak + 4'd1);
+            sec_busy    <= 1'b1;
+        end
+    end else if (sd_sec_read_end) begin
+        sec_busy <= 1'b0;           // 事务结束，下一拍再决定归谁
     end
 end
 
