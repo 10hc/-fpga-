@@ -3,7 +3,9 @@ module sd_card_bmp #(
     parameter integer CLK_FREQ_HZ       = 100_000_000,
     parameter [31:0]  SCAN_START_SECTOR = 32'd0,
     parameter [31:0]  SCAN_MAX_SECTOR   = 32'd131071,
-    parameter [2:0]   SCAN_TARGET_COUNT = 3'd4
+    parameter [2:0]   SCAN_TARGET_COUNT = 3'd4,
+    // 诊断用：一帧应有的像素数（640*480 = 307200）
+    parameter [19:0]  FRAME_PIXELS_EXPECT = 20'd307200
 )(
     input                       clk,
     input                       rst,
@@ -86,6 +88,10 @@ reg              load_busy;
 reg              source_done_seen;
 // 整帧写完事件：与 source_done_seen 谁先到都先记住，两个都到齐才提交（避免先后顺序问题）
 reg              write_done_seen;
+// 诊断：本次加载实际收到多少个像素，以及是否明显不足
+// short_load = 1 表示这一帧陆陆续续只收到不到 307200 个像素（SD 数据在路上丢了）
+reg [19:0]       pix_cnt;
+reg              short_load;
 
 // 看门狗触发过的锁存（屏幕上用方块指示）：加载超时会被“中止”，不再拿没写完的缓冲区去显示
 reg              wd_seen_r;
@@ -137,6 +143,23 @@ always @(posedge clk or posedge rst) begin
 end
 wire load_wd_fire = (load_wd >= LOAD_WD_CYCLES);
 
+// ---------------- 诊断：统计本次加载收到的像素数 ----------------
+// bmp_data_wr_en 每收满一个像素（3 字节）拉高一拍，正常一帧应收到 307200 个。
+// 提交那一刻比较：远小于 307200 就说明这一帧的数据在 SD 通路上被丢了，
+// 屏幕上就会看到“乱的”缓冲区被显示出来。
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        pix_cnt    <= 20'd0;
+        short_load <= 1'b0;
+    end else begin
+        if (!load_busy) pix_cnt <= 20'd0;
+        else if (bmp_data_wr_en) pix_cnt <= pix_cnt + 20'd1;
+
+        if (load_busy && source_done_seen && write_done_seen)
+            short_load <= (pix_cnt < (FRAME_PIXELS_EXPECT - 20'd200));
+    end
+end
+
 // 【踩过的坑，不要再加回来】
 // 曾经在这里加过“源文件送完后等 1ms 就提交”（想摆脱对 write_finish 脉冲的依赖），
 // 结果上电第一张图变成灰黑乱码。原因：bmp_read 的 ready = (state == ST_IDLE)，
@@ -145,9 +168,9 @@ wire load_wd_fire = (load_wd >= LOAD_WD_CYCLES);
 // 结论：提交必须等真正的整帧写完事件 write_done_seen，看门狗只做兜底。
 
 // 屏幕方块诊断（与顶层注释一一对应）：
-// [7]display_valid [6]load_busy [5]source_done_seen [4]write_done_seen
+// [7]display_valid [6]load_busy [5]source_done_seen [4]short_load(1=这一帧没收全)
 // [3]scan_done [2]找到>=1张 [1]找到>=2张 [0]找到>=3张
-assign dbg = {display_valid, load_busy, source_done_seen, write_done_seen,
+assign dbg = {display_valid, load_busy, source_done_seen, short_load,
               scan_done,
               (img_found_count >= 3'd1), (img_found_count >= 3'd2), (img_found_count >= 3'd3)};
 

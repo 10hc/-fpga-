@@ -254,7 +254,37 @@ assign disp_buf_idx       = video_mode ? vid_disp_buf_idx  : img_disp_buf_idx;
 assign write_buf_idx      = video_mode ? vid_write_buf_idx : img_write_buf_idx;
 assign sd_card_write_req  = video_mode ? vid_wr_req        : img_write_req;
 assign sd_card_write_en   = video_mode ? vid_wr_en         : img_write_en;
-assign sd_card_write_data = video_mode ? vid_wr_data       : img_write_data;
+
+// ---- 诊断：单缓冲模式（KEY3 长按）下把写入数据换成"已知图形" ----
+// 目的：把「SDRAM 写/读/显示这条链路」和「SD 读回来的像素数据」分开判断。
+// 打开单缓冲诊断后，写进缓冲区的不是照片，而是一个确定的渐变格：
+//     R = 列号(0..255 循环)   G = 行号(0..255 循环)   B = 0x40
+// 屏幕上出现干净的渐变格 → 写/读/显示链路完全正常，乱码只可能来自 SD 侧数据；
+// 屏幕上还是乱码 → 问题在写/读/显示链路本身（与 SD 无关）。
+reg [9:0] pat_col;
+reg [9:0] pat_row;
+
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all) begin
+        pat_col <= 10'd0;
+        pat_row <= 10'd0;
+    end else if (!single_buf_diag) begin
+        pat_col <= 10'd0;
+        pat_row <= 10'd0;
+    end else if (sd_card_write_en) begin
+        if (pat_col == 10'd639) begin
+            pat_col <= 10'd0;
+            pat_row <= (pat_row == 10'd479) ? 10'd0 : (pat_row + 10'd1);
+        end else begin
+            pat_col <= pat_col + 10'd1;
+        end
+    end
+end
+
+wire [23:0] pat_rgb = {pat_col[7:0], pat_row[7:0], 8'h40};
+wire [31:0] img_write_data_eff = single_buf_diag ? {pat_rgb, 8'b0} : img_write_data;
+
+assign sd_card_write_data = video_mode ? vid_wr_data       : img_write_data_eff;
 
 // ---- 扇区读通道：视频模式独占（音乐自动让路）；否则给 WAV 播放器 ----
 assign sec_to_bmp_read      = video_mode ? vid_sec_read      : wav_sec_read;
@@ -488,18 +518,16 @@ always @(posedge video_clk or posedge rst_all) begin
 end
 
 // 图像模式：看"按下 KEY_2 切图"这条链走到哪一步（方块 1 在最左）
-//   [7] 方块1 display_valid（=1 说明已经有一张图提交成功）
-//   [6] 方块2 load_busy（正在加载；一直红=卡住）
-//   [5] 方块3 source_done_seen（源文件已读完送进 FIFO）
-//   [4] 方块4 write_done_seen（整帧已写进 SDRAM；和方块3 都红后就会提交）
-//   [3] 方块5 scan_done 或 KEY_2 短按已检测
-//   [2] 方块6 找到>=1 张图   [1] 方块7 找到>=2 张   [0] 方块8 找到>=3 张
+//   [7] 方块1 single_buf_diag（KEY3 长按切换的单缓冲测试模式）
+//   [6] 方块2 display_valid（=1 说明已经有一张图提交成功）
+//   [5] 方块3 load_busy（正在加载；一直红=卡住）
+//   [4] 方块4 img_wd_seen（看门狗曾经中止过一次加载）
+//   [3] 方块5 short_load（=1 表示刚提交的那一帧没收全 307200 个像素 → SD 数据在路上丢了）
+//   [2:0] 方块6~8 bmp_read 状态码（1=空闲/已加载完 2=扫描或读头 3=等写许可 4=收像素）
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
     ? { vid_display_valid, vid_active, vid_wr_req, 1'b1, 1'b0, 1'b1, 1'b0, 1'b1 }
-    // 图像模式：方块1=单缓冲诊断模式，方块2=display_valid，方块3=load_busy，
-    //           方块4=看门狗中止过，方块5=write_done_seen，方块6~8=bmp_read 状态码
     : { single_buf_diag, img_dbg[7], img_load_busy, img_wd_seen, img_dbg[4],
         state_code[2:0] };
 wire [7:0] key_dbg = dbg_sel;

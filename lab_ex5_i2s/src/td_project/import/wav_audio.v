@@ -92,8 +92,14 @@ module wav_audio #(
                 S_IDLE: begin
                     sec_read <= 1'b0;
                     if (enable) begin
-                        addr <= SCAN_START;
-                        st   <= S_SCAN_REQ;
+                        if (streaming) begin
+                            // 之前已经在放：直接从当前扇区继续
+                            // （让路只在扇区边界发生，字节对齐没被打断）
+                            st <= S_STR_REQ;
+                        end else begin
+                            addr <= SCAN_START;
+                            st   <= S_SCAN_REQ;
+                        end
                     end
                 end
 
@@ -138,7 +144,13 @@ module wav_audio #(
 
                 // ---------- 流式：等缓冲有空间再读下一扇区 ----------
                 S_STR_REQ: begin
-                    if (buf_room) begin
+                    // 让路：图像加载期间彻底退出 SD 总线。
+                    // 这里正好停在扇区边界（没有字节正在传输），停下不会丢数据，
+                    // 下次 enable 变高时从当前扇区接着读（S_IDLE 里判断 streaming 直接回来）。
+                    if (!enable) begin
+                        sec_read <= 1'b0;
+                        st       <= S_IDLE;
+                    end else if (buf_room) begin
                         sec_read      <= 1'b1;
                         sec_read_addr <= addr;
                         byte_cnt      <= 10'd0;
