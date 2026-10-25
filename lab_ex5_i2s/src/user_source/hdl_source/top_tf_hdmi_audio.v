@@ -500,6 +500,20 @@ always @(*) dbg_sel = video_mode
         state_code[2:0] };
 wire [7:0] key_dbg = dbg_sel;
 
+// 诊断方块要跨时钟域：key_dbg 在 sd_card_clk(100MHz) 域产生，方块画在 video_clk(25MHz) 域。
+// 先打两拍再送进 OSD —— 否则这条跨时钟组合路径会被时序分析当成真实路径
+// （实测 Slack -4.252ns，8 条）。方块是给人看的，打拍引入的瞬时错值无所谓。
+reg [7:0] key_dbg_v1, key_dbg_v2;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        key_dbg_v1 <= 8'd0;
+        key_dbg_v2 <= 8'd0;
+    end else begin
+        key_dbg_v1 <= key_dbg;
+        key_dbg_v2 <= key_dbg_v1;
+    end
+end
+
 wire [23:0] vout_data_adj;
 video_adjust u_video_adjust(
     .clk         (video_clk),
@@ -522,7 +536,7 @@ osd_overlay u_osd_overlay(
     .vs      (vs),
     .osd_en  (osd_on),
     .rgb_in  (vout_data_adj),
-    .key_dbg (key_dbg),
+    .key_dbg (key_dbg_v2),
     .rgb_out (vout_data_osd)
 );
 
