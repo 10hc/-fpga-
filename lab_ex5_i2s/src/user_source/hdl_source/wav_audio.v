@@ -67,8 +67,12 @@ module wav_audio #(
 
     assign playing = streaming;
 
-    // FIFO 有空间才读下一个扇区（留 128 个样本的余量）
-    wire buf_room = (buf_cnt <= 9'd384);
+    // FIFO 有空间才读下一个扇区。
+    // 【必须留一格】wrp==rdp 既是“空”也是“满”的表示：若允许写到正好 512，
+    // 指针相等会被当成空 → 读指针不再前进、写指针继续跑 → 指针永久错位，
+    // 之后放出来的就是垃圾数据（持续刺耳噪音，且切图也回不来）。
+    // 一个扇区最多加 128 个样本，所以阈值取 383 时最大只到 511，永不满格。
+    wire buf_room = (buf_cnt <= 9'd383);
 
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
@@ -144,13 +148,11 @@ module wav_audio #(
 
                 // ---------- 流式：等缓冲有空间再读下一扇区 ----------
                 S_STR_REQ: begin
-                    // 让路：图像加载期间彻底退出 SD 总线。
-                    // 这里正好停在扇区边界（没有字节正在传输），停下不会丢数据，
-                    // 下次 enable 变高时从当前扇区接着读（S_IDLE 里判断 streaming 直接回来）。
-                    if (!enable) begin
-                        sec_read <= 1'b0;
-                        st       <= S_IDLE;
-                    end else if (buf_room) begin
+                    // 不在这里停：仲裁器已经让图像请求优先，WAV 只在图像的空档里
+                    // 插一个扇区（约 300us），而音乐流只要 192KB/s，完全喂得饱。
+                    // 中途停会把缓冲排空 + 指针错位，那正是“切图后音乐变噪音”的来源。
+                    // 真的要让路（进视频模式）时，只在扇区边界停 —— 见 S_STR_DAT。
+                    if (buf_room) begin
                         sec_read      <= 1'b1;
                         sec_read_addr <= addr;
                         byte_cnt      <= 10'd0;
@@ -181,7 +183,7 @@ module wav_audio #(
                             addr      <= addr + 32'd1;
                             data_left <= data_left - 32'd512;
                         end
-                        st <= S_STR_REQ;
+                        st <= enable ? S_STR_REQ : S_IDLE;   // 要让路也只在扇区边界停（字节对齐不被打断）
                     end
                 end
 
