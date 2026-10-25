@@ -215,10 +215,18 @@ module wav_audio #(
         end else begin
             ack_sync <= {ack_sync[0], ack};
             if (!s_valid) begin
-                if (tick && !buf_empty) begin
-                    s_l     <= {sbuf[rdp][15:0],  8'b0};    // 16bit → 24bit
-                    s_r     <= {sbuf[rdp][31:16], 8'b0};
-                    rdp     <= rdp + 9'd1;
+                if (tick) begin
+                    if (!buf_empty) begin
+                        s_l <= {sbuf[rdp][15:0],  8'b0};    // 16bit → 24bit
+                        s_r <= {sbuf[rdp][31:16], 8'b0};
+                        rdp <= rdp + 9'd1;
+                    end else begin
+                        // 缓冲空了（例如正在给图片加载让路）：补一个静音样本。
+                        // 48kHz 的节拍一个都不能少 —— 给 HDMI 的音频流一旦断供，
+                        // 接收端就失去同步，听到的就是持续的噪音（而不是安静）。
+                        s_l <= 24'd0;
+                        s_r <= 24'd0;
+                    end
                     s_valid <= 1'b1;
                 end
             end else if (ack_sync[1]) begin
