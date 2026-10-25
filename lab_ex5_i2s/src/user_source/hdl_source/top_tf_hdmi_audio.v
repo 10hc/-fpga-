@@ -196,12 +196,11 @@ wire [31:0] img_write_data;
 wire [7:0]  img_dbg;          // 图像加载/提交状态（给屏幕方块）
 wire        img_load_busy;    // 正在加载一张图（音频此时让出 SD 总线）
 wire        img_wd_seen;      // 加载超时被看门狗中止过（诊断方块）
+wire        img_sd_init_done; // SD 卡初始化完成（诊断方块 1：长期绿=卡没起来）
 
-// 诊断开关：KEY3 长按切换“单缓冲测试模式”
-// 单缓冲 = 新图写进当前正在显示的那块 SDRAM 缓冲：
-//   若此时屏幕能正常出现新图 → 说明写通道+图像数据都是好的，问题在缓冲切换；
-//   若仍然乱码 → 说明写进去的数据本身就是坏的。
-reg single_buf_diag;
+// 【已删除】单缓冲测试模式（KEY3 长按切换）与它的测试图案：
+//   KEY3 的长按检测在上电/SD 初始化期间会被误触发，结果一上电就进测试模式、
+//   屏幕显示渐变测试图案（红底）。诊断目的已达到，这个开关连同图案一起删掉。
 
 // ---- 扇区读通道：sd_card_bmp 的那一对端口 ----
 wire [7:0]  sec_from_bmp_data;
@@ -257,34 +256,8 @@ assign sd_card_write_en   = video_mode ? vid_wr_en         : img_write_en;
 
 // ---- 诊断：单缓冲模式（KEY3 长按）下把写入数据换成"已知图形" ----
 // 目的：把「SDRAM 写/读/显示这条链路」和「SD 读回来的像素数据」分开判断。
-// 打开单缓冲诊断后，写进缓冲区的不是照片，而是一个确定的渐变格：
-//     R = 列号(0..255 循环)   G = 行号(0..255 循环)   B = 0x40
-// 屏幕上出现干净的渐变格 → 写/读/显示链路完全正常，乱码只可能来自 SD 侧数据；
-// 屏幕上还是乱码 → 问题在写/读/显示链路本身（与 SD 无关）。
-reg [9:0] pat_col;
-reg [9:0] pat_row;
-
-always @(posedge sd_card_clk or posedge rst_all) begin
-    if (rst_all) begin
-        pat_col <= 10'd0;
-        pat_row <= 10'd0;
-    end else if (!single_buf_diag) begin
-        pat_col <= 10'd0;
-        pat_row <= 10'd0;
-    end else if (sd_card_write_en) begin
-        if (pat_col == 10'd639) begin
-            pat_col <= 10'd0;
-            pat_row <= (pat_row == 10'd479) ? 10'd0 : (pat_row + 10'd1);
-        end else begin
-            pat_col <= pat_col + 10'd1;
-        end
-    end
-end
-
-wire [23:0] pat_rgb = {pat_col[7:0], pat_row[7:0], 8'h40};
-wire [31:0] img_write_data_eff = single_buf_diag ? {pat_rgb, 8'b0} : img_write_data;
-
-assign sd_card_write_data = video_mode ? vid_wr_data       : img_write_data_eff;
+// 图像路径的写数据 = sd_card_bmp 送出的 BMP 像素（测试图案已删除）
+assign sd_card_write_data = video_mode ? vid_wr_data : img_write_data;
 
 // ---- 扇区读通道：视频模式独占（音乐自动让路）；否则给 WAV 播放器 ----
 assign sec_to_bmp_read      = video_mode ? vid_sec_read      : wav_sec_read;
@@ -312,11 +285,12 @@ sd_card_bmp #(
     .key_next          (key_next_img),
     .key_auto          (key_auto_img),
     .suspend           (video_mode),
-    .single_buf        (single_buf_diag),
+    .single_buf        (1'b0),
     .state_code        (state_code),
     .dbg               (img_dbg),
     .load_busy_o       (img_load_busy),
     .wd_seen           (img_wd_seen),
+    .sd_init_done_o    (img_sd_init_done),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
     .display_valid     (img_display_valid),
@@ -472,12 +446,6 @@ always @(posedge video_clk or posedge rst_all) begin
     end
 end
 
-// KEY3 长按同时切换“单缓冲测试模式”（诊断开关；对比度会跟着循环，先不管）
-always @(posedge video_clk or posedge rst_all) begin
-    if (rst_all)      single_buf_diag <= 1'b0;
-    else if (k3_long) single_buf_diag <= ~single_buf_diag;
-end
-
 // ===================== 屏幕顶部 8 个方块（诊断用） =====================
 // 方块含义随模式自动切换，具体见文件末尾 key_dbg 定义处的注释。
 // 绿色 = 0，红色 = 1；从左到右对应 key_dbg[7] .. key_dbg[0]。
@@ -518,7 +486,7 @@ always @(posedge video_clk or posedge rst_all) begin
 end
 
 // 图像模式：看"按下 KEY_2 切图"这条链走到哪一步（方块 1 在最左）
-//   [7] 方块1 single_buf_diag（KEY3 长按切换的单缓冲测试模式）
+//   [7] 方块1 sd_init_done（=1 说明 SD 卡初始化成功；一直绿=卡没起来，后面全白搭）
 //   [6] 方块2 display_valid（=1 说明已经有一张图提交成功）
 //   [5] 方块3 load_busy（正在加载；一直红=卡住）
 //   [4] 方块4 img_wd_seen（看门狗曾经中止过一次加载）
@@ -528,7 +496,7 @@ reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
     ? { vid_display_valid, vid_active, vid_wr_req, 1'b1, 1'b0, 1'b1, 1'b0, 1'b1 }
-    : { single_buf_diag, img_dbg[7], img_load_busy, img_wd_seen, img_dbg[4],
+    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_dbg[4],
         state_code[2:0] };
 wire [7:0] key_dbg = dbg_sel;
 

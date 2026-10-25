@@ -17,6 +17,7 @@ module sd_card_bmp #(
     output [7:0]                dbg,           // 调试：加载/提交状态，给屏幕方块用
     output                      load_busy_o,   // 调试：正在加载一张图
     output                      wd_seen,       // 调试：加载超时被看门狗中止过
+    output                      sd_init_done_o,// 调试：SD 卡初始化完成（1=就绪，长时间 0=卡没起来）
     input  [15:0]               bmp_width,
     input  [15:0]               bmp_height,
     output reg                  display_valid,
@@ -60,6 +61,7 @@ wire             sd_sec_read_end;
 wire             bmp_data_wr_en;
 wire [23:0]      bmp_data;
 wire             sd_init_done;
+assign           sd_init_done_o = sd_init_done;
 wire             bmp_ready;
 wire             scan_done;
 wire             scan_found_valid;
