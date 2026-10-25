@@ -118,15 +118,12 @@ always @(posedge clk or posedge rst) begin
 end
 wire load_wd_fire = (load_wd >= LOAD_WD_CYCLES);
 
-// 源文件送完后再等约 1ms（100_000 拍 @100MHz），让还在 FIFO 里的几十~几百个字写进 SDRAM。
-// 这样即使 write_finish 脉冲因故没到，也能提交出完整图像（实测第一张图能正常显示就靠这条 + 看门狗兜底）
-reg [16:0] drain_cnt;
-always @(posedge clk or posedge rst) begin
-    if (rst)                                  drain_cnt <= 17'd0;
-    else if (!load_busy || !source_done_seen) drain_cnt <= 17'd0;
-    else if (drain_cnt < 17'd100_000)         drain_cnt <= drain_cnt + 17'd1;
-end
-wire drain_done = (drain_cnt >= 17'd100_000);
+// 【踩过的坑，不要再加回来】
+// 曾经在这里加过“源文件送完后等 1ms 就提交”（想摆脱对 write_finish 脉冲的依赖），
+// 结果上电第一张图变成灰黑乱码。原因：bmp_read 的 ready = (state == ST_IDLE)，
+// 它是“空闲可接收”而不是“送完了”，load_busy 一拉高它还是 1，
+// 所以 source_done_seen 在加载刚开始就被置起，1ms 后提交的是几乎空的缓冲区。
+// 结论：提交必须等真正的整帧写完事件 write_done_seen，看门狗只做兜底。
 
 // 屏幕方块诊断（与顶层注释一一对应）：
 // [7]display_valid [6]load_busy [5]source_done_seen [4]write_done_seen
@@ -268,8 +265,10 @@ always @(posedge clk or posedge rst) begin
             if (load_busy && write_finish_pulse)
                 write_done_seen  <= 1'b1;
 
-            // 源文件送完 + （整帧写完 或 再等 1ms）→ 提交新图并切换显示缓冲区
-            if (load_busy && source_done_seen && (write_done_seen || drain_done)) begin
+            // 真正整帧写完（write_done_seen）才提交新图并切换显示缓冲区。
+            // 注意：source_done_seen 其实在加载一开始就被置起了（见文件上方“踩过的坑”），
+            // 所以这里的实质判据是 write_done_seen，看门狗负责兜底。
+            if (load_busy && source_done_seen && write_done_seen) begin
                 load_busy             <= 1'b0;
                 source_done_seen      <= 1'b0;
                 write_done_seen       <= 1'b0;
@@ -281,10 +280,9 @@ always @(posedge clk or posedge rst) begin
 
             // 看门狗兜底：超过 2 秒仍未提交就结束本次加载。
             // 若源文件其实已经送完（数据早已写进 SDRAM），直接提交，避免“永远没有图”
-            if (load_busy && load_wd_fire && !(source_done_seen && (write_done_seen || drain_done))) begin
+            if (load_busy && load_wd_fire && !(source_done_seen && write_done_seen)) begin
                 load_busy        <= 1'b0;
                 source_done_seen <= 1'b0;
-                    write_done_seen  <= 1'b0;
                 write_done_seen  <= 1'b0;
                 if (source_done_seen) begin
                     disp_buf_idx          <= pending_buf_idx;
