@@ -532,7 +532,7 @@ reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
     ? { vid_display_valid, 1'b1, vid_active, 1'b0, vid_st_dbg[3:0] }
-    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, fat_state_dbg[3:0] };
+    : { img_sd_init_done, img_dbg[7], img_load_busy, wav_playing, fat_state_dbg[3:0] };
 wire [7:0] key_dbg = dbg_sel;
 
 // 诊断方块要跨时钟域：key_dbg 在 sd_card_clk(100MHz) 域产生，方块画在 video_clk(25MHz) 域。

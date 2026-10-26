@@ -190,7 +190,8 @@ module wav_audio #(
                         sec_read <= 1'b0;
                         if (data_left <= 32'd512) begin
                             addr      <= data_start;      // 循环回开头
-                            data_left <= hdr[351:320];
+                            data_left <= (hdr[351:320] > 32'd468)
+                                          ? (hdr[351:320] - 32'd468) : 32'd0;  // 回卷同样要减掉 468 字节偏移
                         end else begin
                             addr      <= addr + 32'd1;
                             data_left <= data_left - 32'd512;
