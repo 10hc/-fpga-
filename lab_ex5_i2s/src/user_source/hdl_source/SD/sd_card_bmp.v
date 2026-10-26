@@ -516,7 +516,7 @@ always @(posedge clk or posedge rst) begin
         locate_start_pulse <= 1'b0;
     end else begin
         locate_start_pulse <= 1'b0;
-        if (!locate_kicked && sd_init_done && bmp_ready) begin
+        if (!locate_kicked && sd_init_done) begin
             locate_kicked      <= 1'b1;
             locate_start_pulse <= 1'b1;
         end
