@@ -529,8 +529,8 @@ end
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
-    ? { vid_display_valid, vid_active, vid_wr_req, 1'b1, 1'b0, 1'b1, 1'b0, 1'b1 }
-    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_dbg[4],
+    ? { vid_display_valid, 1'b1, vid_active, 1'b0, vid_st_dbg[3:0] }
+    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, sd_locate_done,
         state_code[2:0] };
 wire [7:0] key_dbg = dbg_sel;
 

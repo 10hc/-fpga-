@@ -62,7 +62,8 @@ wire [31:0] fat_wav_sector;
 wire        fat_vid_valid;
 wire [31:0] fat_vid_sector;
 wire        fat_done, fat_error;
-wire        fat_sel;                  // 目录解析独占 SD 读通道（超时后自动让出）
+wire        fat_sel;                  // = fat_grant（锁存的总线授权）
+reg         fat_grant;                // 目录解析占用总线（授权即锁定到事务结束）
 
 wire key_next_press;
 wire key_auto_press;
@@ -93,11 +94,13 @@ wire [2:0]       scan_found_total;
 // 目录解析兜底超时：万一解析卡住（异常卡/非 FAT32），3 秒后仍退回原来的暴力扫描，
 // 至少保证“还能看图”，不会因为解析失败导致整机无图。
 // ---------------------------------------------------------------------------
-localparam [28:0] LOCATE_TO_CYCLES = 29'd300_000_000;   // 3s @100MHz
+localparam [28:0] LOCATE_TO_CYCLES = 29'd100_000_000;   // 1s @100MHz（解析只需几个扇区）
 reg  [28:0] locate_to_cnt;
 wire        locate_to = (locate_to_cnt >= LOCATE_TO_CYCLES);
 wire        locate_ok = locate_done | locate_to;
-assign fat_sel = fat_req & ~locate_to;   // 解析超时 -> 让出总线，图像/音频照常工作
+// fat_sel 现在是【锁存的授权】（见下面仲裁器）：一旦把总线交给目录解析，
+// 就锁死到这次事务结束，绝不中途改地址/掐数据。
+assign fat_sel = fat_grant;
 
 always @(posedge clk or posedge rst) begin
     if (rst) locate_to_cnt <= 29'd0;
@@ -565,15 +568,23 @@ localparam [3:0] WAV_QUOTA = 4'd2;  // 图像连拿 2 个后必须让 1 个给�
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         granted_wav <= 1'b0;
+        fat_grant   <= 1'b0;
         sec_busy    <= 1'b0;
         bmp_streak  <= 4'd0;
     end else if (!sec_busy) begin
         // 总线空闲：一拍内决定下一个事务归谁，并立刻置 busy 锁死
-        if (wav_sec_read && (bmp_streak >= WAV_QUOTA || !bmp_sec_read)) begin
+        if (fat_req && !locate_to) begin
+            // 目录解析优先级最高：只在启动阶段跑，且超时后彻底放弃（locate_to）
+            fat_grant   <= 1'b1;
+            granted_wav <= 1'b0;
+            sec_busy    <= 1'b1;
+        end else if (wav_sec_read && (bmp_streak >= WAV_QUOTA || !bmp_sec_read)) begin
+            fat_grant   <= 1'b0;
             granted_wav <= 1'b1;
             bmp_streak  <= 4'd0;
             sec_busy    <= 1'b1;
         end else if (bmp_sec_read) begin
+            fat_grant   <= 1'b0;
             granted_wav <= 1'b0;
             bmp_streak  <= (bmp_streak >= WAV_QUOTA) ? WAV_QUOTA : (bmp_streak + 4'd1);
             sec_busy    <= 1'b1;
@@ -584,8 +595,8 @@ always @(posedge clk or posedge rst) begin
 end
 
 // 目录解析优先级最高（它只在启动阶段跑，此时图像/音频都还没开始用总线）
-assign sd_sec_read      = fat_sel ? 1'b1      : (granted_wav ? wav_sec_read      : bmp_sec_read);
-assign sd_sec_read_addr = fat_sel ? fat_addr  : (granted_wav ? wav_sec_read_addr : bmp_sec_read_addr);
+assign sd_sec_read      = fat_grant ? 1'b1     : (granted_wav ? wav_sec_read      : bmp_sec_read);
+assign sd_sec_read_addr = fat_grant ? fat_addr : (granted_wav ? wav_sec_read_addr : bmp_sec_read_addr);
 
 // 数据只回送给被授权的一方
 assign bmp_sec_read_data       = sd_sec_read_data;
