@@ -14,6 +14,7 @@ module sd_card_bmp #(
     input                       suspend,       // 视频模式：停掉图片自动播放/加载，别和视频抢带宽
     input                       single_buf,    // 诊断：单缓冲测试（新图写进当前正在显示的缓冲，用来分辨“写坏了”还是“切缓冲坏了”）
     output [3:0]                state_code,
+    output                      locate_done_latched,  // 目录解析成功过（锁存版，给诊断方块⑤）
     output [7:0]                dbg,           // 调试：加载/提交状态，给屏幕方块用
     output                      load_busy_o,   // 调试：正在加载一张图
     output                      wd_seen,       // 调试：加载超时被看门狗中止过
@@ -553,6 +554,7 @@ fat32_scan #(
 );
 
 assign locate_done     = fat_done;
+assign locate_done_latched = locate_done_r;   // 锁存版：解析成功过就一直是 1（诊断方块⑤）
 assign locate_error    = fat_error;
 
 assign vid_file_valid  = fat_vid_valid;

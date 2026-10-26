@@ -299,6 +299,7 @@ assign wav_sec_read_data_valid = sec_from_bmp_data_valid & ~video_mode;
 assign wav_sec_read_end        = sec_from_bmp_end        & ~video_mode;
 
 // ===================== TF 多图扫描与缓存（双缓冲） =====================
+wire img_locate_done_latched;   // 目录解析成功过（锁存位，给诊断方块⑤）
 sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
     .SCAN_START_SECTOR (32'd0),
@@ -325,6 +326,7 @@ sd_card_bmp #(
     // ===== FAT32 目录解析（一次到位，供视频/音频跳转）=====
     .locate_done       (sd_locate_done),
     .locate_error      (sd_locate_error),
+    .locate_done_latched(img_locate_done_latched),
     .fat_state_dbg     (fat_state_dbg),
     .vid_file_valid    (vid_file_valid),
     .vid_file_sector   (vid_file_sector),
@@ -525,14 +527,16 @@ end
 //   [7] 方块1 sd_init_done（=1 说明 SD 卡初始化成功；一直绿=卡没起来，后面全白搭）
 //   [6] 方块2 display_valid（=1 说明已经有一张图提交成功）
 //   [5] 方块3 load_busy（正在加载；一直红=卡住）
-//   [4] 方块4 img_wd_seen（看门狗曾经中止过一次加载）
-//   [3] 方块5 short_load（=1 表示刚提交的那一帧没收全 307200 个像素 → SD 数据在路上丢了）
-//   [2:0] 方块6~8 bmp_read 状态码（1=空闲/已加载完 2=扫描或读头 3=等写许可 4=收像素）
+//   [4] 方块4 img_wd_seen（加载确实写完了整帧）
+//   [3] 方块5 locate_done_latched（红=目录解析成功过；绿=从没成功→走了暴力扫描兜底）
+//   [2] 方块6 sd_locate_error（红=解析报错）
+//   [1] 方块7 wav_file_valid（红=目录里认出了 A1.WAV；WAV 走“目录给的首扇区”）
+//   [0] 方块8 wav_playing（红=WAV 路已被选中在播：此时听到的是卡里的 WAV，不是 ROM 样例）
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
     ? { vid_display_valid, 1'b1, vid_active, 1'b0, vid_st_dbg[3:0] }
-    : { img_sd_init_done, img_dbg[7], img_load_busy, wav_playing, fat_state_dbg[3:0] };
+    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_playing };
 wire [7:0] key_dbg = dbg_sel;
 
 // 诊断方块要跨时钟域：key_dbg 在 sd_card_clk(100MHz) 域产生，方块画在 video_clk(25MHz) 域。
