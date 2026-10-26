@@ -94,13 +94,13 @@ wire [2:0]       scan_found_total;
 // 目录解析兜底超时：万一解析卡住（异常卡/非 FAT32），3 秒后仍退回原来的暴力扫描，
 // 至少保证“还能看图”，不会因为解析失败导致整机无图。
 // ---------------------------------------------------------------------------
-localparam [28:0] LOCATE_TO_CYCLES = 29'd100_000_000;   // 1s @100MHz（解析只需几个扇区）
+localparam [28:0] LOCATE_TO_CYCLES = 29'd300_000_000;   // 3s @100MHz（解析只需几个扇区，留足余量）
 reg  [28:0] locate_to_cnt;
 wire        locate_to = (locate_to_cnt >= LOCATE_TO_CYCLES);
 wire        locate_ok = locate_done | locate_to;
 // fat_sel 现在是【锁存的授权】（见下面仲裁器）：一旦把总线交给目录解析，
 // 就锁死到这次事务结束，绝不中途改地址/掐数据。
-assign fat_sel = fat_grant;
+assign fat_sel = fat_grant & ~locate_to;
 
 always @(posedge clk or posedge rst) begin
     if (rst) locate_to_cnt <= 29'd0;
@@ -565,6 +565,18 @@ reg sec_busy;
 reg [3:0] bmp_streak;               // 图像连续拿到的扇区数
 localparam [3:0] WAV_QUOTA = 4'd2;  // 图像连拿 2 个后必须让 1 个给音频
 
+// 总线看门狗：一次事务（读一个扇区）正常约 1ms，超过 10ms 一定是卡住了
+// （命令没回 / 数据没来）。强行释放总线，避免“一次卡死拖垮全部功能”。
+reg  [23:0] bus_wd;
+localparam [23:0] BUS_WD_MAX = 24'd1_000_000;   // 10ms @100MHz
+wire bus_wd_fire = (bus_wd >= BUS_WD_MAX);
+
+always @(posedge clk or posedge rst) begin
+    if (rst) bus_wd <= 24'd0;
+    else if (!sec_busy || sd_sec_read_end) bus_wd <= 24'd0;
+    else if (bus_wd < BUS_WD_MAX) bus_wd <= bus_wd + 24'd1;
+end
+
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         granted_wav <= 1'b0;
@@ -589,13 +601,22 @@ always @(posedge clk or posedge rst) begin
             bmp_streak  <= (bmp_streak >= WAV_QUOTA) ? WAV_QUOTA : (bmp_streak + 4'd1);
             sec_busy    <= 1'b1;
         end
-    end else if (sd_sec_read_end) begin
-        sec_busy <= 1'b0;           // 事务结束，下一拍再决定归谁
+    end else if (sd_sec_read_end || bus_wd_fire) begin
+        sec_busy <= 1'b0;           // 事务结束（或看门狗强拆），下一拍再决定归谁
+        if (bus_wd_fire) begin
+            fat_grant   <= 1'b0;    // 超时：一定把授权和数据屏蔽位一起放掉
+            granted_wav <= 1'b0;
+        end
     end
 end
 
 // 目录解析优先级最高（它只在启动阶段跑，此时图像/音频都还没开始用总线）
-assign sd_sec_read      = fat_grant ? 1'b1     : (granted_wav ? wav_sec_read      : bmp_sec_read);
+// 注意：这里必须用【目录解析自己的请求 fat_req】，不能恒为 1'b1。
+// 恒为 1 会让 SD 控制器背靠背不停地重发 CMD17（扇区之间没有空隙），
+// 卡会返回垃圾、控制器卡在命令状态 → sd_sec_read_end 不再产生 →
+// sec_busy 永远为 1 → fat_grant 永远为 1 → 图像/视频/音频的数据全被 &~fat_sel 屏蔽，
+// 表现为“图像和视频都永远停在扫描”。这是 2026-10-26 上板照片定位到的真因。
+assign sd_sec_read      = fat_grant ? fat_req : (granted_wav ? wav_sec_read      : bmp_sec_read);
 assign sd_sec_read_addr = fat_grant ? fat_addr : (granted_wav ? wav_sec_read_addr : bmp_sec_read_addr);
 
 // 数据只回送给被授权的一方
