@@ -229,62 +229,71 @@ module wav_audio #(
         else           acc <= acc + SAMPLE_RATE;
     end
 
-    reg        s_valid;
+    // ==================== 样本搬运（sd 域 → 持稳寄存器）====================
+    // 【2026-10-26 重写】原来的做法是“sd 域 48kHz 节拍 + 四相握手”：
+    //   节拍产生在 sd 域；若上一拍样本还没被视频域取走，这一拍就被整拍丢掉；
+    //   缓冲空时还补静音。结果送给 HDMI 的音频流 cadence 不稳、偶尔断供，
+    //   接收端失锁 → 持续刺耳的沙沙声（测试音那条链在音频域精确 48kHz，所以干净）。
+    // 现在：sd 域只负责“把样本搬进持稳寄存器，并用 toggle 通知”；
+    //       输出节拍改在 **视频域** 用累加器精确产生 48kHz，一个节拍都不丢；
+    //       缓冲空时保持上一个样本（不补静音，避免爆音）。
+    reg        s_toggle;             // 每送出一个样本翻转一次（跨域通知用）
     reg [23:0] s_l, s_r;
-    reg [1:0]  ack_sync;             // 来自视频域的 ack
-    reg        ack;                  // 回给 sd 域的应答（vid 域驱动）
 
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
-            s_valid  <= 1'b0;
+            s_toggle <= 1'b0;
             s_l      <= 24'd0;
             s_r      <= 24'd0;
-            ack_sync <= 2'd0;
-            rdp <= 9'd0;                              // rdp 唯一驱动点
-        end else begin
-            ack_sync <= {ack_sync[0], ack};
-            if (!s_valid) begin
-                if (tick) begin
-                    if (!buf_empty) begin
-                        s_l <= {sbuf[rdp][15:0],  8'b0};    // 16bit → 24bit
-                        s_r <= {sbuf[rdp][31:16], 8'b0};
-                        rdp <= rdp + 9'd1;
-                    end else begin
-                        // 缓冲空了（例如正在给图片加载让路）：补一个静音样本。
-                        // 48kHz 的节拍一个都不能少 —— 给 HDMI 的音频流一旦断供，
-                        // 接收端就失去同步，听到的就是持续的噪音（而不是安静）。
-                        s_l <= 24'd0;
-                        s_r <= 24'd0;
-                    end
-                    s_valid <= 1'b1;
-                end
-            end else if (ack_sync[1]) begin
-                s_valid <= 1'b0;                            // 收到应答，结束本次
+            rdp      <= 9'd0;                         // rdp 唯一驱动点
+        end else if (tick) begin
+            if (!buf_empty) begin
+                s_l <= {sbuf[rdp][15:0],  8'b0};      // 16bit → 24bit
+                s_r <= {sbuf[rdp][31:16], 8'b0};
+                rdp <= rdp + 9'd1;
             end
+            // 缓冲空（例如正在给图片加载让路）：保持上一个样本，
+            // 节拍照走 —— 给 HDMI 的音频流一旦断供，接收端失锁就是持续噪音。
+            s_toggle <= ~s_toggle;
         end
     end
 
-    // ==================== 握手接收（vid 域）====================
-    reg [1:0] v_sync;
+    // ==================== 48kHz 输出节拍（视频域，精确）====================
+    reg  [31:0] vacc;
+    wire vtick = ((vacc + SAMPLE_RATE) >= VID_CLK_HZ);
+
+    always @(posedge vid_clk or posedge vid_rst) begin
+        if (vid_rst) vacc <= 32'd0;
+        else if (vtick) vacc <= vacc + SAMPLE_RATE - VID_CLK_HZ;
+        else            vacc <= vacc + SAMPLE_RATE;
+    end
+
+    // ==================== 音频输出（vid 域）====================
+    reg [1:0]  tog_sync;
+    reg [23:0] h_l, h_r;             // 持稳样本（上一个有效样本）
 
     always @(posedge vid_clk or posedge vid_rst) begin
         if (vid_rst) begin
-            v_sync    <= 2'd0;
-            ack       <= 1'b0;
+            tog_sync  <= 2'd0;
+            h_l       <= 24'd0;
+            h_r       <= 24'd0;
             aud_valid <= 1'b0;
             aud_left  <= 24'd0;
             aud_right <= 24'd0;
         end else begin
-            v_sync <= {v_sync[0], s_valid};
-            if (v_sync[1] && !ack) begin
-                // s_valid 已被同步 2 拍，s_l/s_r 早已稳定
-                aud_left  <= s_l;
-                aud_right <= s_r;
+            tog_sync <= {tog_sync[0], s_toggle};
+            // toggle 变化 = sd 域刚送来一个新样本（s_l/s_r 已稳定 ≥2 个视频时钟）
+            if (tog_sync[1] ^ tog_sync[0]) begin
+                h_l <= s_l;
+                h_r <= s_r;
+            end
+            // 精确 48kHz 输出，一个节拍都不少
+            if (vtick) begin
+                aud_left  <= h_l;
+                aud_right <= h_r;
                 aud_valid <= 1'b1;
-                ack       <= 1'b1;
             end else begin
                 aud_valid <= 1'b0;
-                if (!v_sync[1]) ack <= 1'b0;
             end
         end
     end
