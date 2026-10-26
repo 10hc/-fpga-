@@ -22,6 +22,7 @@ module sd_card_bmp #(
     // ===== FAT32 目录解析结果（上电一次，替代逐扇区暴力扫描）=====
     output                      locate_done,     // 目录解析完成
     output                      locate_error,    // 目录解析失败（退回暴力扫描）
+    output [3:0]                fat_state_dbg,   // 目录解析状态机状态（调试方块用）
     output                      vid_file_valid,  // 找到 .VID 视频文件
     output [31:0]               vid_file_sector, // .VID 首扇区
     output                      wav_file_valid,  // 找到 .WAV 音频文件
@@ -532,6 +533,7 @@ fat32_scan #(
     .sd_init_done   (sd_init_done),
     .busy           (),
     .done           (fat_done),
+    .state_dbg      (fat_state_dbg),
     .error          (fat_error),
     .sd_req         (fat_req),
     .sd_addr        (fat_addr),

@@ -217,6 +217,7 @@ wire        img_sd_init_done; // SD 卡初始化完成（诊断方块 1：长期
 // ---- FAT32 目录解析结果：直接定位 .VID / .WAV，避免逐扇区扫描 ----
 wire        sd_locate_done;    // 目录解析完成
 wire        sd_locate_error;   // 解析失败（无卡 / 非 FAT32）
+wire [3:0]  fat_state_dbg;      // 目录解析状态机状态（调试方块）
 wire        vid_file_valid;    // 目录里找到了 .VID
 wire [31:0] vid_file_sector;   // .VID 文件首扇区
 wire        wav_file_valid;    // 目录里找到了 .WAV
@@ -324,6 +325,7 @@ sd_card_bmp #(
     // ===== FAT32 目录解析（一次到位，供视频/音频跳转）=====
     .locate_done       (sd_locate_done),
     .locate_error      (sd_locate_error),
+    .fat_state_dbg     (fat_state_dbg),
     .vid_file_valid    (vid_file_valid),
     .vid_file_sector   (vid_file_sector),
     .wav_file_valid    (wav_file_valid),
@@ -530,8 +532,7 @@ reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
     ? { vid_display_valid, 1'b1, vid_active, 1'b0, vid_st_dbg[3:0] }
-    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, sd_locate_done,
-        state_code[2:0] };
+    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, fat_state_dbg[3:0] };
 wire [7:0] key_dbg = dbg_sel;
 
 // 诊断方块要跨时钟域：key_dbg 在 sd_card_clk(100MHz) 域产生，方块画在 video_clk(25MHz) 域。

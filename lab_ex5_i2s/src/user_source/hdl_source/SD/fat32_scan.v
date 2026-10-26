@@ -28,6 +28,7 @@ module fat32_scan #(
 
     // SD 扇区读客户端
     output reg         sd_req,
+    output wire [3:0]  state_dbg,   // 调试：目录解析状态机当前状态
     output reg  [31:0] sd_addr,
     input  wire [7:0]  sd_data,
     input  wire        sd_data_valid,
@@ -573,5 +574,7 @@ module fat32_scan #(
             end
         end
     end
+
+assign state_dbg = state;   // 调试输出：解析状态机状态
 
 endmodule
