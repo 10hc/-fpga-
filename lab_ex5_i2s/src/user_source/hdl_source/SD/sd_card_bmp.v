@@ -53,6 +53,7 @@ module sd_card_bmp #(
 );
 // ===================== FAT32 目录解析（上电一次）=====================
 reg         locate_kicked;
+reg         locate_done_r;   // locate_done 只有一拍，锁存成电平（jump_en/超时用）
 reg         locate_start_pulse;
 wire        fat_req;
 wire [31:0] fat_addr;
@@ -98,7 +99,7 @@ wire [2:0]       scan_found_total;
 localparam [29:0] LOCATE_TO_CYCLES = 30'd800_000_000;   // 8s：从“解析开始”起算（见下方计数器）
 reg  [29:0] locate_to_cnt;
 wire        locate_to = (locate_to_cnt >= LOCATE_TO_CYCLES);
-wire        locate_ok = locate_done | locate_to;
+wire        locate_ok = locate_done_r | locate_to;
 // fat_sel 现在是【锁存的授权】（见下面仲裁器）：一旦把总线交给目录解析，
 // 就锁死到这次事务结束，绝不中途改地址/掐数据。
 assign fat_sel = fat_grant & ~locate_to;
@@ -108,7 +109,7 @@ always @(posedge clk or posedge rst) begin
     // 旧写法从上电就开始计时：SD 卡初始化要 1~2 秒，加上解析本身，
     // 3 秒很容易在解析还没跑完时就到点 → locate_to=1 → 快路径被放弃 → 退回 40 秒暴力扫描。
     if (rst) locate_to_cnt <= 30'd0;
-    else if (!locate_kicked || locate_done || locate_to) locate_to_cnt <= 30'd0;
+    else if (!locate_kicked || locate_done_r || locate_to) locate_to_cnt <= 30'd0;
     else locate_to_cnt <= locate_to_cnt + 30'd1;
 end
 
@@ -485,7 +486,7 @@ bmp_read bmp_read_m0(
     .scan_found_sector      (scan_found_sector),
     .scan_found_total       (scan_found_total),
 
-    .jump_en                (locate_done && (fat_bmp_count != 3'd0)),
+    .jump_en        (locate_done_r && (fat_bmp_count != 3'd0)),
     .jump_count             (fat_bmp_count),
     .jump_sector0           (fat_bmp_sector0),
     .jump_sector1           (fat_bmp_sector1),
@@ -569,7 +570,7 @@ assign wav_file_sector = fat_wav_sector;
 reg granted_wav;
 reg sec_busy;
 reg [3:0] bmp_streak;               // 图像连续拿到的扇区数
-localparam [3:0] WAV_QUOTA = 4'd2;  // 图像连拿 2 个后必须让 1 个给音频
+localparam [3:0] WAV_QUOTA = 4'd1;  // 图像连拿 2 个后必须让 1 个给音频
 
 // 总线看门狗：一次事务（读一个扇区）正常约 1ms，超过 10ms 一定是卡住了
 // （命令没回 / 数据没来）。强行释放总线，避免“一次卡死拖垮全部功能”。
@@ -654,6 +655,14 @@ sd_card_top sd_card_top_m0(
     .sd_sec_write_end       ()
 );
 
+// 【2026-10-26 修】locate_done 只持续一拍（fat32_scan 回 ST_IDLE 就清零），
+// 而 jump_en / 超时判断要晚一拍才用它 —— 结果快跳 100% 失效、永远退回 40 秒暴力扫描。
+// 这里把它锁存成电平：解析成功一次就长期有效。
+always @(posedge clk or posedge rst) begin
+    if (rst) locate_done_r <= 1'b0;
+    else if (locate_done) locate_done_r <= 1'b1;
+end
+
 endmodule
 
 module key_press_debounce #(
@@ -699,5 +708,6 @@ always @(posedge clk or posedge rst) begin
         end
     end
 end
+
 
 endmodule
