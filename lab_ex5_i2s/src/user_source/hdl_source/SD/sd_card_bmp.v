@@ -623,8 +623,20 @@ end
 // 卡会返回垃圾、控制器卡在命令状态 → sd_sec_read_end 不再产生 →
 // sec_busy 永远为 1 → fat_grant 永远为 1 → 图像/视频/音频的数据全被 &~fat_sel 屏蔽，
 // 表现为“图像和视频都永远停在扫描”。这是 2026-10-26 上板照片定位到的真因。
-assign sd_sec_read      = fat_grant ? fat_req : (granted_wav ? wav_sec_read      : bmp_sec_read);
-assign sd_sec_read_addr = fat_grant ? fat_addr : (granted_wav ? wav_sec_read_addr : bmp_sec_read_addr);
+// ===== 关键修复 2026-10-26：请求/地址必须与【本拍】的授权同主 =====
+// 原实现用“已寄存的授权”(fat_grant/granted_wav) 选请求与地址，而仲裁器要到判定那一拍
+// 结束时才更新授权。若上一任主（图像）此时还压着请求，SD 控制器
+// (sd_card_sec_read_write.v 的 S_WAIT_READ_WRITE) 会在同一拍把【图像】的地址锁进 sec_addr，
+// 于是出现“音频被授权、却收到图像扇区的字节” → WAV 从头就是噪音；
+// 图像侧只是少读一次、它会重发同一地址，所以图像看起来完全正常。
+// 现在改成用组合授权选地址：授权/请求/地址三者永远同拍、同主。
+wire fat_req_eff   = fat_req & ~locate_to;
+wire want_wav_now  = wav_sec_read & (bmp_streak >= WAV_QUOTA || !bmp_sec_read);
+wire grant_fat_now = sec_busy ? fat_grant   : fat_req_eff;
+wire grant_wav_now = sec_busy ? granted_wav : (fat_req_eff ? 1'b0 : want_wav_now);
+
+assign sd_sec_read      = grant_fat_now ? fat_req : (grant_wav_now ? wav_sec_read      : bmp_sec_read);
+assign sd_sec_read_addr = grant_fat_now ? fat_addr : (grant_wav_now ? wav_sec_read_addr : bmp_sec_read_addr);
 
 // 数据只回送给被授权的一方
 assign bmp_sec_read_data       = sd_sec_read_data;
