@@ -69,6 +69,7 @@ module wav_audio #(
     reg [15:0]  l16;                 // 组装的左声道
     reg [7:0]   r_low;               // 右声道低字节
     reg         streaming;
+    reg [24:0]  to_cnt;   // S_STR_DAT 超时计数（看门狗强拆事务时自恢复）
     reg [31:0]  data_left;           // 剩余数据字节（循环用）
     reg [31:0]  data_start;
 
@@ -168,6 +169,7 @@ module wav_audio #(
                         sec_read      <= 1'b1;
                         sec_read_addr <= addr;
                         byte_cnt      <= 10'd0;
+                        to_cnt        <= 25'd0;
                         st            <= S_STR_DAT;
                     end
                 end
@@ -186,6 +188,18 @@ module wav_audio #(
                         endcase
                         byte_cnt <= byte_cnt + 10'd1;
                     end
+                    // 【2026-10-26 修】总线看门狗强拆事务时 sec_read_end 会丢，本状态原没有超时，
+                    // 会一直等下去且 byte_cnt 不复位 → 下次重发同一扇区时 4 字节组相位错开，
+                    // 拼出的样本全是乱码 = 持续沙沙噪音。这里加超时并复位字节相位。
+                    if (sec_read_data_valid) to_cnt <= 25'd0;
+                    else if (to_cnt >= 25'd2_000_000) begin   // 20ms @100MHz，长于总线看门狗 10ms
+                        sec_read <= 1'b0;
+                        byte_cnt <= 10'd0;
+                        l16      <= 16'd0;
+                        r_low    <= 8'd0;
+                        to_cnt   <= 25'd0;
+                        st       <= S_STR_REQ;                // 重新请求同一扇区
+                    end else to_cnt <= to_cnt + 25'd1;
                     if (sec_read_end) begin
                         sec_read <= 1'b0;
                         if (data_left <= 32'd512) begin

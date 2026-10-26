@@ -712,9 +712,9 @@ wav_audio #(
     .playing             (wav_playing)
 );
 
-assign audio_valid      = wav_playing ? wav_valid      : tone_valid;
-assign audio_left_data  = wav_playing ? wav_left_data  : tone_left_data;
-assign audio_right_data = wav_playing ? wav_right_data : tone_right_data;
+assign audio_valid      = (wav_playing & wav_file_valid) ? wav_valid      : tone_valid;
+assign audio_left_data  = (wav_playing & wav_file_valid) ? wav_left_data  : tone_left_data;
+assign audio_right_data = (wav_playing & wav_file_valid) ? wav_right_data : tone_right_data;
 
 audio_arc_calculate #(
     .ACR_N         (6144)
