@@ -94,8 +94,8 @@ wire [2:0]       scan_found_total;
 // 目录解析兜底超时：万一解析卡住（异常卡/非 FAT32），3 秒后仍退回原来的暴力扫描，
 // 至少保证“还能看图”，不会因为解析失败导致整机无图。
 // ---------------------------------------------------------------------------
-localparam [28:0] LOCATE_TO_CYCLES = 29'd300_000_000;   // 3s @100MHz（解析只需几个扇区，留足余量）
-reg  [28:0] locate_to_cnt;
+localparam [29:0] LOCATE_TO_CYCLES = 30'd800_000_000;   // 8s：从“解析开始”起算（见下方计数器）
+reg  [29:0] locate_to_cnt;
 wire        locate_to = (locate_to_cnt >= LOCATE_TO_CYCLES);
 wire        locate_ok = locate_done | locate_to;
 // fat_sel 现在是【锁存的授权】（见下面仲裁器）：一旦把总线交给目录解析，
@@ -103,8 +103,12 @@ wire        locate_ok = locate_done | locate_to;
 assign fat_sel = fat_grant & ~locate_to;
 
 always @(posedge clk or posedge rst) begin
-    if (rst) locate_to_cnt <= 29'd0;
-    else if (!locate_done && !locate_to) locate_to_cnt <= locate_to_cnt + 29'd1;
+    // 【2026-10-26 修正】超时从"解析真正开始(locate_kicked)"起算。
+    // 旧写法从上电就开始计时：SD 卡初始化要 1~2 秒，加上解析本身，
+    // 3 秒很容易在解析还没跑完时就到点 → locate_to=1 → 快路径被放弃 → 退回 40 秒暴力扫描。
+    if (rst) locate_to_cnt <= 30'd0;
+    else if (!locate_kicked || locate_done || locate_to) locate_to_cnt <= 30'd0;
+    else locate_to_cnt <= locate_to_cnt + 30'd1;
 end
 
 reg              scan_start_pulse;
