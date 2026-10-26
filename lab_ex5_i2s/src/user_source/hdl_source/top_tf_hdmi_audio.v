@@ -198,6 +198,14 @@ wire        img_load_busy;    // 正在加载一张图（音频此时让出 SD �
 wire        img_wd_seen;      // 加载超时被看门狗中止过（诊断方块）
 wire        img_sd_init_done; // SD 卡初始化完成（诊断方块 1：长期绿=卡没起来）
 
+// ---- FAT32 目录解析结果：直接定位 .VID / .WAV，避免逐扇区扫描 ----
+wire        sd_locate_done;    // 目录解析完成
+wire        sd_locate_error;   // 解析失败（无卡 / 非 FAT32）
+wire        vid_file_valid;    // 目录里找到了 .VID
+wire [31:0] vid_file_sector;   // .VID 文件首扇区
+wire        wav_file_valid;    // 目录里找到了 .WAV
+wire [31:0] wav_file_sector;   // .WAV 文件首扇区
+
 // 【已删除】单缓冲测试模式（KEY3 长按切换）与它的测试图案：
 //   KEY3 的长按检测在上电/SD 初始化期间会被误触发，结果一上电就进测试模式、
 //   屏幕显示渐变测试图案（红底）。诊断目的已达到，这个开关连同图案一起删掉。
@@ -230,6 +238,8 @@ video_player #(
     .clk                 (sd_card_clk),
     .rst                 (rst_all),
     .enable              (video_mode),
+    .file_valid          (vid_file_valid),
+    .file_sector         (vid_file_sector),
     .sec_read            (vid_sec_read),
     .sec_read_addr       (vid_sec_read_addr),
     .sec_read_data       (vid_sec_read_data),
@@ -294,6 +304,14 @@ sd_card_bmp #(
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
     .display_valid     (img_display_valid),
+
+    // ===== FAT32 目录解析（一次到位，供视频/音频跳转）=====
+    .locate_done       (sd_locate_done),
+    .locate_error      (sd_locate_error),
+    .vid_file_valid    (vid_file_valid),
+    .vid_file_sector   (vid_file_sector),
+    .wav_file_valid    (wav_file_valid),
+    .wav_file_sector   (wav_file_sector),
 
     .write_finish_toggle(frame_write_toggle_mem),
     .write_buf_idx     (img_write_buf_idx),
@@ -664,6 +682,8 @@ wav_audio #(
     .vid_clk             (video_clk),
     .vid_rst             (rst_all),
     .enable              (display_valid & ~video_mode & ~img_load_busy),  // 视频模式/加载图片时音频让路
+    .file_valid          (wav_file_valid),
+    .file_sector         (wav_file_sector),
     .sec_read            (wav_sec_read),
     .sec_read_addr       (wav_sec_read_addr),
     .sec_read_data       (wav_sec_read_data),

@@ -27,6 +27,11 @@ module video_player #(
     input  wire        rst,
     input  wire        enable,
 
+    // 目录解析结果：file_valid=1 时直接从 file_sector 开始找 "VID1"，
+    // 不再从扇区 0 逐扇区扫描（原来要扫 13 万扇区 ≈ 40~50 秒）。
+    input  wire        file_valid,
+    input  wire [31:0] file_sector,
+
     output reg         sec_read,
     output reg  [31:0] sec_read_addr,
     input  wire [7:0]  sec_read_data,
@@ -153,6 +158,10 @@ module video_player #(
         end
     end
 
+    // 跳转模式下只容忍文件首扇区后 3 个扇区（头部正常就在首扇区），
+    // 找不到就放弃，保持图像模式；没有目录信息时才退回原来的全盘扫描。
+    wire [31:0] scan_stop = file_valid ? (file_sector + 32'd3) : SCAN_MAX;
+
     // ---------------- 主状态机 ----------------
     always @(posedge clk or posedge rst) begin
         if (rst) begin
@@ -190,7 +199,7 @@ module video_player #(
             S_IDLE: begin
                 sec_read <= 1'b0;
                 if (enable) begin
-                    addr    <= SCAN_START;
+                    addr    <= file_valid ? file_sector : SCAN_START;
                     hdr_cnt <= 10'd0;
                     hdr32   <= 32'd0;
                     st      <= S_SCAN;
@@ -215,7 +224,7 @@ module video_player #(
                         // 头部就在命中魔数的这个扇区里，地址不加；
                         // 头部读完后再 +1，帧数据从下一个扇区开始
                         st   <= S_HDR;
-                    end else if (addr < SCAN_MAX) begin
+                    end else if (addr < scan_stop) begin
                         addr <= addr + 32'd1;
                     end else begin
                         st <= S_IDLE;                          // 没找到，保持图像模式

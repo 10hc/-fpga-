@@ -103,6 +103,14 @@
                     <Attr Name="CompileOrder" Val="19"/>
                 </FileInfo>
             </File>
+            <File Path="../user_source/hdl_source/SD/fat32_scan.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&amp;R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="17"/>
+                </FileInfo>
+            </File>
             <File Path="../user_source/hdl_source/SD/bmp_read.v">
                 <FileInfo>
                     <Attr Name="UsedInSyn" Val="true"/>

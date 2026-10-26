@@ -18,6 +18,14 @@ module sd_card_bmp #(
     output                      load_busy_o,   // 调试：正在加载一张图
     output                      wd_seen,       // 调试：加载超时被看门狗中止过
     output                      sd_init_done_o,// 调试：SD 卡初始化完成（1=就绪，长时间 0=卡没起来）
+
+    // ===== FAT32 目录解析结果（上电一次，替代逐扇区暴力扫描）=====
+    output                      locate_done,     // 目录解析完成
+    output                      locate_error,    // 目录解析失败（退回暴力扫描）
+    output                      vid_file_valid,  // 找到 .VID 视频文件
+    output [31:0]               vid_file_sector, // .VID 首扇区
+    output                      wav_file_valid,  // 找到 .WAV 音频文件
+    output [31:0]               wav_file_sector, // .WAV 首扇区
     input  [15:0]               bmp_width,
     input  [15:0]               bmp_height,
     output reg                  display_valid,
@@ -42,6 +50,19 @@ module sd_card_bmp #(
     output                      wav_sec_read_data_valid,
     output                      wav_sec_read_end
 );
+// ===================== FAT32 目录解析（上电一次）=====================
+reg         locate_kicked;
+reg         locate_start_pulse;
+wire        fat_req;
+wire [31:0] fat_addr;
+wire [2:0]  fat_bmp_count;
+wire [31:0] fat_bmp_sector0, fat_bmp_sector1, fat_bmp_sector2, fat_bmp_sector3;
+wire        fat_wav_valid;
+wire [31:0] fat_wav_sector;
+wire        fat_vid_valid;
+wire [31:0] fat_vid_sector;
+wire        fat_done, fat_error;
+wire        fat_sel = fat_req;      // 目录解析期间独占 SD 读通道
 
 wire key_next_press;
 wire key_auto_press;
@@ -67,6 +88,20 @@ wire             scan_done;
 wire             scan_found_valid;
 wire [31:0]      scan_found_sector;
 wire [2:0]       scan_found_total;
+
+// ---------------------------------------------------------------------------
+// 目录解析兜底超时：万一解析卡住（异常卡/非 FAT32），3 秒后仍退回原来的暴力扫描，
+// 至少保证“还能看图”，不会因为解析失败导致整机无图。
+// ---------------------------------------------------------------------------
+localparam [28:0] LOCATE_TO_CYCLES = 29'd300_000_000;   // 3s @100MHz
+reg  [28:0] locate_to_cnt;
+wire        locate_to = (locate_to_cnt >= LOCATE_TO_CYCLES);
+wire        locate_ok = locate_done | locate_to;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) locate_to_cnt <= 29'd0;
+    else if (!locate_done && !locate_to) locate_to_cnt <= locate_to_cnt + 29'd1;
+end
 
 reg              scan_start_pulse;
 reg              load_start_pulse;
@@ -335,7 +370,7 @@ always @(posedge clk or posedge rst) begin
             end
 
             // 上电后自动发起一次“扫描前 4 张 BMP”
-            if (!scan_kicked && bmp_ready) begin
+            if (!scan_kicked && bmp_ready && locate_ok) begin
                 scan_start_pulse      <= 1'b1;
                 scan_kicked           <= 1'b1;
                 first_image_committed <= 1'b0;
@@ -441,6 +476,13 @@ bmp_read bmp_read_m0(
     .scan_found_sector      (scan_found_sector),
     .scan_found_total       (scan_found_total),
 
+    .jump_en                (locate_done && (fat_bmp_count != 3'd0)),
+    .jump_count             (fat_bmp_count),
+    .jump_sector0           (fat_bmp_sector0),
+    .jump_sector1           (fat_bmp_sector1),
+    .jump_sector2           (fat_bmp_sector2),
+    .jump_sector3           (fat_bmp_sector3),
+
     .load_start             (load_start_pulse),
     .load_sector            (load_sector),
 
@@ -458,6 +500,54 @@ bmp_read bmp_read_m0(
     .bmp_data_wr_en         (bmp_data_wr_en),
     .bmp_data               (bmp_data)
 );
+
+// 目录解析：SD 初始化完成后、BMP 扫描开始前，先做一次（此时读通道空闲）
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        locate_kicked      <= 1'b0;
+        locate_start_pulse <= 1'b0;
+    end else begin
+        locate_start_pulse <= 1'b0;
+        if (!locate_kicked && sd_init_done && bmp_ready) begin
+            locate_kicked      <= 1'b1;
+            locate_start_pulse <= 1'b1;
+        end
+    end
+end
+
+fat32_scan #(
+    .MAX_BMP_COUNT (3'd4)
+) u_fat32_scan (
+    .clk            (clk),
+    .rst            (rst),
+    .start          (locate_start_pulse),
+    .sd_init_done   (sd_init_done),
+    .busy           (),
+    .done           (fat_done),
+    .error          (fat_error),
+    .sd_req         (fat_req),
+    .sd_addr        (fat_addr),
+    .sd_data        (sd_sec_read_data),
+    .sd_data_valid  (sd_sec_read_data_valid & fat_sel),
+    .sd_end         (sd_sec_read_end & fat_sel),
+    .bmp_count      (fat_bmp_count),
+    .bmp_sector0    (fat_bmp_sector0),
+    .bmp_sector1    (fat_bmp_sector1),
+    .bmp_sector2    (fat_bmp_sector2),
+    .bmp_sector3    (fat_bmp_sector3),
+    .wav_valid      (fat_wav_valid),
+    .wav_sector     (fat_wav_sector),
+    .vid_valid      (fat_vid_valid),
+    .vid_sector     (fat_vid_sector)
+);
+
+assign locate_done     = fat_done;
+assign locate_error    = fat_error;
+
+assign vid_file_valid  = fat_vid_valid;
+assign vid_file_sector = fat_vid_sector;
+assign wav_file_valid  = fat_wav_valid;
+assign wav_file_sector = fat_wav_sector;
 
 // ===================== 扇区读仲裁：配额轮转（图像 2 : 音频 1）=====================
 // ① 一次事务 = 授权那一刻就锁住 sec_busy，直到 read_end 才放开。
@@ -492,17 +582,18 @@ always @(posedge clk or posedge rst) begin
     end
 end
 
-assign sd_sec_read      = granted_wav ? wav_sec_read      : bmp_sec_read;
-assign sd_sec_read_addr = granted_wav ? wav_sec_read_addr : bmp_sec_read_addr;
+// 目录解析优先级最高（它只在启动阶段跑，此时图像/音频都还没开始用总线）
+assign sd_sec_read      = fat_sel ? 1'b1      : (granted_wav ? wav_sec_read      : bmp_sec_read);
+assign sd_sec_read_addr = fat_sel ? fat_addr  : (granted_wav ? wav_sec_read_addr : bmp_sec_read_addr);
 
 // 数据只回送给被授权的一方
 assign bmp_sec_read_data       = sd_sec_read_data;
-assign bmp_sec_read_data_valid = sd_sec_read_data_valid & ~granted_wav;
-assign bmp_sec_read_end        = sd_sec_read_end        & ~granted_wav;
+assign bmp_sec_read_data_valid = sd_sec_read_data_valid & ~granted_wav & ~fat_sel;
+assign bmp_sec_read_end        = sd_sec_read_end        & ~granted_wav & ~fat_sel;
 
 assign wav_sec_read_data       = sd_sec_read_data;
-assign wav_sec_read_data_valid = sd_sec_read_data_valid & granted_wav;
-assign wav_sec_read_end        = sd_sec_read_end        & granted_wav;
+assign wav_sec_read_data_valid = sd_sec_read_data_valid & granted_wav & ~fat_sel;
+assign wav_sec_read_end        = sd_sec_read_end        & granted_wav & ~fat_sel;
 
 sd_card_top sd_card_top_m0(
     .clk                    (clk),

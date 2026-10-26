@@ -62,6 +62,35 @@ assign sd_sec_write_data_req = (state == S_WRITE) && block_write_data_rd;
 assign block_write_data = sd_sec_write_data;
 assign sd_sec_write_end = (state == S_WRITE_END);
 
+// ---------------------------------------------------------------------------
+// 【加固】上电延时 + 初始化看门狗
+//   1) 上电后先等 POR_CYCLES(10ms)，再发 CMD0：SD 卡上电需要稳定时间 + 至少 74 个时钟
+//   2) 2 秒内 sd_init_done 还没拉高（没插好/接触不良/命令无响应）就强制回 S_IDLE 重来
+//      原来任何一条命令无响应都会永久卡在这一步，表现就是红屏(state_code=0)
+// ---------------------------------------------------------------------------
+localparam [27:0] POR_CYCLES     = 28'd1_000_000;    // 10ms @100MHz
+localparam [27:0] INIT_WD_CYCLES = 28'd200_000_000;  // 2s   @100MHz
+
+reg  [19:0] por_cnt;
+reg  [27:0] init_wd;
+wire        por_ok  = (por_cnt  >= POR_CYCLES[19:0]);
+wire        init_to = (init_wd >= INIT_WD_CYCLES);
+
+always@(posedge clk or posedge rst)
+begin
+	if(rst == 1'b1)
+	begin
+		por_cnt <= 20'd0;
+		init_wd <= 28'd0;
+	end
+	else
+	begin
+		if(por_cnt != POR_CYCLES[19:0]) por_cnt <= por_cnt + 20'd1;
+		if(sd_init_done || state == S_IDLE) init_wd <= 28'd0;
+		else if(init_wd != INIT_WD_CYCLES)  init_wd <= init_wd + 28'd1;
+	end
+end
+
 always@(posedge clk or posedge rst)
 begin
 	if(rst == 1'b1)
@@ -78,10 +107,19 @@ begin
 		sd_init_done <= 1'b0;
 	end
 	else
+		if(init_to && !sd_init_done)
+		begin
+			state <= S_IDLE;                  // 初始化超时 -> 从头再来
+			cmd_req <= 1'b0;
+			block_write_req <= 1'b0;
+			block_read_req <= 1'b0;
+			spi_clk_div <= SPI_LOW_SPEED_DIV[15:0];
+		end
+		else
 		case(state)
 			S_IDLE:
 			begin
-				state <= S_CMD0;
+				state <= por_ok ? S_CMD0 : S_IDLE;
 				sd_init_done <= 1'b0;
 				spi_clk_div <= SPI_LOW_SPEED_DIV[15:0];
 			end

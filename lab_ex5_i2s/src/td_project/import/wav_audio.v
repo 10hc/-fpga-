@@ -27,6 +27,10 @@ module wav_audio #(
     input  wire        vid_rst,
     input  wire        enable,             // 例如首图显示后拉高
 
+    // 目录解析结果：file_valid=1 时直接从 file_sector 开始找 RIFF，不再全盘扫描
+    input  wire        file_valid,
+    input  wire [31:0] file_sector,
+
     // ---- 扇区读接口（→ sd_card_bmp 的 WAV 通道）----
     output reg         sec_read,
     output reg  [31:0] sec_read_addr,
@@ -42,13 +46,16 @@ module wav_audio #(
 );
 
     // ==================== 样本环形缓冲（sd 域，512×32 推断 BRAM）====================
-    reg [31:0] sbuf [0:511];
-    reg [8:0]  wrp, rdp;
+    reg [31:0] sbuf [0:4095];
+    reg [11:0] wrp, rdp;
 
-    wire [8:0] buf_cnt   = wrp - rdp;
+    wire [11:0] buf_cnt  = wrp - rdp;
     wire       buf_empty = (wrp == rdp);
 
     // ==================== 状态机（sd 域）====================
+    // 跳转模式下只容忍文件首扇区后 3 个扇区
+    wire [31:0] scan_stop = file_valid ? (file_sector + 32'd3) : SCAN_MAX;
+
     localparam S_IDLE     = 3'd0;
     localparam S_SCAN_REQ = 3'd1;
     localparam S_SCAN_DAT = 3'd2;
@@ -72,7 +79,10 @@ module wav_audio #(
     // 指针相等会被当成空 → 读指针不再前进、写指针继续跑 → 指针永久错位，
     // 之后放出来的就是垃圾数据（持续刺耳噪音，且切图也回不来）。
     // 一个扇区最多加 128 个样本，所以阈值取 383 时最大只到 511，永不满格。
-    wire buf_room = (buf_cnt <= 9'd383);
+    // 【必须留一格】wrp==rdp 既是“空”也是“满”的表示：允许写到 4095 就不能再写，
+    // 否则计数绕回 0 会被当成“空”，读写指针永久错位（噪音）。
+    // 4096 样本 = 85ms @48kHz，足够吸收图像连续占总线造成的抖动。
+    wire buf_room = (buf_cnt <= 12'd3967);
 
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
@@ -87,7 +97,7 @@ module wav_audio #(
             streaming     <= 1'b0;
             data_left     <= 32'd0;
             data_start    <= 32'd0;
-            wrp           <= 9'd0;
+            wrp <= 12'd0;
             // 注意：rdp 只在下面"48kHz 节拍 + 握手"那个 always 块里驱动
             //      （包括它的复位），否则综合器会报 multiple drivers
         end else begin
@@ -101,7 +111,7 @@ module wav_audio #(
                             // （让路只在扇区边界发生，字节对齐没被打断）
                             st <= S_STR_REQ;
                         end else begin
-                            addr <= SCAN_START;
+                            addr <= file_valid ? file_sector : SCAN_START;
                             st   <= S_SCAN_REQ;
                         end
                     end
@@ -137,7 +147,7 @@ module wav_audio #(
                             data_left  <= (hdr[351:320] > 32'd468)
                                           ? (hdr[351:320] - 32'd468) : 32'd0;
                             st         <= S_STR_REQ;
-                        end else if (addr < SCAN_MAX) begin
+                        end else if (addr < scan_stop) begin
                             addr <= addr + 32'd1;
                             st   <= S_SCAN_REQ;
                         end else begin
@@ -169,7 +179,7 @@ module wav_audio #(
                             2'd2: r_low     <= sec_read_data;
                             2'd3: begin
                                 sbuf[wrp] <= {sec_read_data, r_low, l16}; // {R,L}
-                                wrp      <= wrp + 9'd1;
+                                wrp <= wrp + 12'd1;
                             end
                         endcase
                         byte_cnt <= byte_cnt + 10'd1;
@@ -213,7 +223,7 @@ module wav_audio #(
             s_l      <= 24'd0;
             s_r      <= 24'd0;
             ack_sync <= 2'd0;
-            rdp      <= 9'd0;                              // rdp 唯一驱动点
+            rdp <= 12'd0;                              // rdp 唯一驱动点
         end else begin
             ack_sync <= {ack_sync[0], ack};
             if (!s_valid) begin
@@ -221,7 +231,7 @@ module wav_audio #(
                     if (!buf_empty) begin
                         s_l <= {sbuf[rdp][15:0],  8'b0};    // 16bit → 24bit
                         s_r <= {sbuf[rdp][31:16], 8'b0};
-                        rdp <= rdp + 9'd1;
+                        rdp <= rdp + 12'd1;
                     end else begin
                         // 缓冲空了（例如正在给图片加载让路）：补一个静音样本。
                         // 48kHz 的节拍一个都不能少 —— 给 HDMI 的音频流一旦断供，

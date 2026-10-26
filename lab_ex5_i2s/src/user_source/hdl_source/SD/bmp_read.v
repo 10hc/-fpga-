@@ -13,6 +13,15 @@ module bmp_read(
     output reg [31:0]           scan_found_sector,
     output reg [2:0]            scan_found_total,
 
+    // 目录解析结果（跳转模式）：已知文件首扇区时直接访问，避免逐扇区暴力扫描。
+    // jump_en=1 时只访问 jump_count 个候选扇区（来自 FAT32 根目录）。
+    input                       jump_en,
+    input  [2:0]                jump_count,
+    input  [31:0]               jump_sector0,
+    input  [31:0]               jump_sector1,
+    input  [31:0]               jump_sector2,
+    input  [31:0]               jump_sector3,
+
     // 按指定扇区加载一张图到 SDRAM
     input                       load_start,
     input  [31:0]               load_sector,
@@ -54,6 +63,7 @@ reg [15:0] bit_count;
 reg [31:0] compression;
 
 reg [31:0] scan_sector;
+reg [2:0]  jump_idx;                // 跳转模式：当前访问到第几个候选文件
 reg [31:0] load_sector_latched;
 reg [31:0] bmp_len_cnt;
 reg [1:0]  bmp_byte_idx;
@@ -77,6 +87,15 @@ assign bmp_data_valid = (sd_sec_read_data_valid == 1'b1) &&
 assign file_sector_count = (file_len == 32'd0) ? 32'd1 : ((file_len + 32'd511) >> 9);
 assign next_scan_sector_if_match = scan_sector + file_sector_count;
 assign next_scan_sector_if_miss  = scan_sector + 32'd1;
+
+// 跳转模式的候选扇区选择（纯 32 位四选一，不涉及运算，时序无压力）
+wire [31:0] jump_sector_at = (jump_idx == 3'd0) ? jump_sector0 :
+                             (jump_idx == 3'd1) ? jump_sector1 :
+                             (jump_idx == 3'd2) ? jump_sector2 : jump_sector3;
+wire [31:0] jump_sector_nx = (jump_idx == 3'd0) ? jump_sector1 :
+                             (jump_idx == 3'd1) ? jump_sector2 :
+                             (jump_idx == 3'd2) ? jump_sector3 : jump_sector0;
+wire        jump_last      = (jump_idx + 3'd1 >= jump_count);
 
 always @(posedge clk or posedge rst) begin
     if (rst) begin
@@ -228,8 +247,9 @@ always @(posedge clk or posedge rst) begin
                 if (scan_start) begin
                     scan_done        <= 1'b0;
                     scan_found_total <= 3'd0;
-                    scan_sector      <= scan_start_sector;
-                    sd_sec_read_addr <= scan_start_sector;
+                    jump_idx         <= 3'd0;
+                    scan_sector      <= jump_en ? jump_sector0 : scan_start_sector;
+                    sd_sec_read_addr <= jump_en ? jump_sector0 : scan_start_sector;
                     state            <= ST_SCAN;
                 end else if (load_start) begin
                     load_sector_latched <= load_sector;
@@ -245,7 +265,22 @@ always @(posedge clk or posedge rst) begin
                 if (sd_sec_read_end) begin
                     sd_sec_read <= 1'b0;
 
-                    if (header_match) begin
+                    if (jump_en) begin
+                        // ===== 跳转模式：只访问目录里列出的那些扇区，秒级完成 =====
+                        jump_idx <= jump_idx + 3'd1;
+                        if (header_match) begin
+                            scan_found_valid  <= 1'b1;
+                            scan_found_sector <= scan_sector;
+                            scan_found_total  <= scan_found_total + 3'd1;
+                        end
+                        if (jump_last) begin
+                            scan_done <= 1'b1;
+                            state     <= ST_IDLE;
+                        end else begin
+                            sd_sec_read_addr <= jump_sector_nx;
+                            scan_sector      <= jump_sector_nx;
+                        end
+                    end else if (header_match) begin
                         scan_found_valid  <= 1'b1;
                         scan_found_sector <= scan_sector;
                         scan_found_total  <= scan_found_total + 3'd1;
