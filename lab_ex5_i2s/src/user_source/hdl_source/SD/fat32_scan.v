@@ -292,10 +292,18 @@ module fat32_scan #(
                             10'd14: reserved_sectors[7:0]  <= sd_data;
                             10'd15: reserved_sectors[15:8] <= sd_data;
                             10'd16: num_fats <= sd_data;
-                            10'd32: fat_size[7:0]   <= sd_data;
-                            10'd33: fat_size[15:8]  <= sd_data;
-                            10'd34: fat_size[23:16] <= sd_data;
-                            10'd35: fat_size[31:24] <= sd_data;
+                            10'd32: ;   // BPB_TotSec32（总扇区数，本模块不用）
+                            10'd33: ;
+                            10'd34: ;
+                            10'd35: ;
+                            // !! FAT32 的 FATSz32 在偏移 36，不是 32。
+                            //    之前错读成 32..35（=总扇区数 31116256），
+                            //    导致 data_start = 保留扇区 + 2*31116256 = 62234924，
+                            //    根目录扇区飞到卡外 → 一个文件都找不到。
+                            10'd36: fat_size[7:0]   <= sd_data;
+                            10'd37: fat_size[15:8]  <= sd_data;
+                            10'd38: fat_size[23:16] <= sd_data;
+                            10'd39: fat_size[31:24] <= sd_data;
                             10'd44: root_cluster[7:0]   <= sd_data;
                             10'd45: root_cluster[15:8]  <= sd_data;
                             10'd46: root_cluster[23:16] <= sd_data;
