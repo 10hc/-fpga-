@@ -698,7 +698,12 @@ wav_audio #(
     .sd_rst              (rst_all),
     .vid_clk             (video_clk),
     .vid_rst             (rst_all),
-    .enable              (display_valid & ~video_mode & ~img_load_busy),  // 视频模式/加载图片时音频让路
+    // 【2026-10-26 改】不再因“正在加载图片”而停音频。
+    // 轮播间隔是 1 秒（sd_card_bmp: auto_tick = auto_cnt == CLK_FREQ_HZ-1），
+    // 所以每 1 秒就有一次图片加载；以前用 ~img_load_busy 停音频，一停一启
+    // 正好与“音乐一秒后变噪音”对上。仲裁器本身已按 2:1 配额保证图像优先，
+    // 音频只需 192KB/s（占 4MB/s 的 5%），不需要停。
+    .enable              (display_valid & ~video_mode),
     .file_valid          (wav_file_valid),
     .file_sector         (wav_file_sector),
     .sec_read            (wav_sec_read),
