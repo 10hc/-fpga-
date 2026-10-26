@@ -163,6 +163,21 @@ always @(posedge ext_mem_clk or posedge rst_all) begin
         frame_write_toggle_mem <= ~frame_write_toggle_mem;
 end
 
+// ---------------------------------------------------------------------------
+// 【上电按键屏蔽】复位后 2 秒内忽略所有按键。
+//   原因：上电瞬间 SD 卡初始化会让整机停顿，这段时间里按键电平若有毛刺/
+//   长按电平会被 key_short_long 误判为“长按”，表现为一上电就进了视频模式（深蓝屏）。
+// ---------------------------------------------------------------------------
+reg [25:0] warmup_cnt;                       // 2s @25MHz
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) warmup_cnt <= 26'd0;
+    else if (warmup_cnt != 26'd50_000_000) warmup_cnt <= warmup_cnt + 26'd1;
+end
+wire warmup_done = (warmup_cnt >= 26'd50_000_000);
+wire key1_g = warmup_done ? key1 : 1'b1;     // 未到时间一律当“松开”
+wire key2_g = warmup_done ? key2 : 1'b1;
+wire key3_g = warmup_done ? key3 : 1'b1;
+
 // ===================== 视频播放模式（KEY2 长按 >1.5s 切换）=====================
 wire k2_short, k2_long;
 key_short_long #(
@@ -171,7 +186,7 @@ key_short_long #(
 ) u_key2_video (
     .clk         (video_clk),
     .rst         (rst_all),
-    .button      (key1),                 // 板上 KEY_2
+    .button      (key1_g),                 // 板上 KEY_2
     .short_pulse (k2_short),
     .long_pulse  (k2_long)
 );
@@ -183,8 +198,9 @@ always @(posedge video_clk or posedge rst_all) begin
 end
 
 // 视频模式下屏蔽图像路径的按键（高=未按下），避免它去抢 SD 卡
-wire key_next_img = video_mode ? 1'b1 : key1;
-wire key_auto_img = video_mode ? 1'b1 : key2;
+
+wire key_next_img = video_mode ? 1'b1 : key1_g;
+wire key_auto_img = video_mode ? 1'b1 : key2_g;
 
 // ---- 图像路径（sd_card_bmp）的原始信号 ----
 wire        img_display_valid;
@@ -447,7 +463,7 @@ key_short_long #(
 ) u_key3_adj (
     .clk         (video_clk),
     .rst         (rst_all),
-    .button      (key3),
+    .button      (key3_g),
     .short_pulse (k3_short),
     .long_pulse  (k3_long)
 );
@@ -472,7 +488,7 @@ always @(posedge video_clk or posedge rst_all) begin
     if (rst_all) begin
         k1_lvl <= 1'b1; k2_lvl <= 1'b1; k3_lvl <= 1'b1;
     end else begin
-        k1_lvl <= key1; k2_lvl <= key2; k3_lvl <= key3;
+        k1_lvl <= key1_g; k2_lvl <= key2_g; k3_lvl <= key3_g;
     end
 end
 
@@ -484,7 +500,7 @@ key_short_long #(
 ) u_key4_det (
     .clk         (video_clk),
     .rst         (rst_all),
-    .button      (key2),
+    .button      (key2_g),
     .short_pulse (k4_short),
     .long_pulse  (k4_long)
 );

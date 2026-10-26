@@ -62,7 +62,7 @@ wire [31:0] fat_wav_sector;
 wire        fat_vid_valid;
 wire [31:0] fat_vid_sector;
 wire        fat_done, fat_error;
-wire        fat_sel = fat_req;      // 目录解析期间独占 SD 读通道
+wire        fat_sel;                  // 目录解析独占 SD 读通道（超时后自动让出）
 
 wire key_next_press;
 wire key_auto_press;
@@ -97,6 +97,7 @@ localparam [28:0] LOCATE_TO_CYCLES = 29'd300_000_000;   // 3s @100MHz
 reg  [28:0] locate_to_cnt;
 wire        locate_to = (locate_to_cnt >= LOCATE_TO_CYCLES);
 wire        locate_ok = locate_done | locate_to;
+assign fat_sel = fat_req & ~locate_to;   // 解析超时 -> 让出总线，图像/音频照常工作
 
 always @(posedge clk or posedge rst) begin
     if (rst) locate_to_cnt <= 29'd0;
