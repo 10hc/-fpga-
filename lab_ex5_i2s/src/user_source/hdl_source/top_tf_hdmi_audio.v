@@ -585,7 +585,7 @@ wire cfg_bilinear = ~swk_v2[3];   // SWKEY4: 双线性放大（预留）
 // ===== Sobel 边缘检测（经典 3×3 算子，可旁路）=====
 wire [23:0] vout_data_sob;
 wire        de_sob, vs_sob;
-sobel_edge #(.WIDTH(640), .DLY(1283)) u_sobel_edge(
+sobel_edge #(.WIDTH(640)) u_sobel_edge(
     .clk     (video_clk),
     .rst     (rst_all),
     .de      (de),
