@@ -191,7 +191,7 @@ module wav_audio #(
                             2'd1: l16[15:8] <= sec_read_data;
                             2'd2: r_low     <= sec_read_data;
                             2'd3: begin
-                                sbuf[wrp] <= {sec_read_data, r_low, l16}; // {R,L}
+                                // 数据写入在模块末尾的专用 always 块里（为了被推断成块 RAM）
                                 wrp <= wrp + 9'd1;
                             end
                         endcase
@@ -264,13 +264,9 @@ module wav_audio #(
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
             s_toggle <= 1'b0;
-            s_l      <= 24'd0;
-            s_r      <= 24'd0;
             rdp      <= 9'd0;                         // rdp 唯一驱动点
         end else if (tick) begin
             if (!buf_empty) begin
-                s_l <= {sbuf[rdp][15:0],  8'b0};      // 16bit → 24bit
-                s_r <= {sbuf[rdp][31:16], 8'b0};
                 rdp <= rdp + 9'd1;
             end
             // 缓冲空（例如正在给图片加载让路）：保持上一个样本，
@@ -315,6 +311,28 @@ module wav_audio #(
                 aud_valid <= 1'b1;
             end else begin
                 aud_valid <= 1'b0;
+            end
+        end
+    end
+
+    // ==================== 采样环形缓冲的块 RAM 读写 ====================
+    // 写口与读口放在同一个 always 块里、读口寄存，安路综合器才会推断成 BRAM；
+    // 若把读值先做选择再寄存，或读写分处两个 always，就会退化成分布式 RAM
+    // （512x32 会吃掉约 2754 个 LUT，这是上一版的实测值）。
+    wire        sbuf_we  = (st == S_STR_DAT) && sec_read_data_valid && !draining
+                           && (byte_cnt[1:0] == 2'd3);
+    wire [31:0] sbuf_din = {sec_read_data, r_low, l16};
+    wire        sbuf_re  = tick && !buf_empty;
+
+    always @(posedge sd_clk or posedge sd_rst) begin
+        if (sd_rst) begin
+            s_l <= 24'd0;
+            s_r <= 24'd0;
+        end else begin
+            if (sbuf_we) sbuf[wrp] <= sbuf_din;
+            if (sbuf_re) begin
+                s_l <= {sbuf[rdp][15:0],  8'b0};      // 16bit → 24bit
+                s_r <= {sbuf[rdp][31:16], 8'b0};
             end
         end
     end
