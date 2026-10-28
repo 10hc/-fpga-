@@ -31,7 +31,12 @@ module sobel_edge #(
             g    <= 8'd0;
             de_d <= 1'b0;
         end else begin
-            g <= (77 * rgb_in[23:16] + 150 * rgb_in[15:8] + 29 * rgb_in[7:0]) >> 8;
+            // 灰度用最省的 (R + 2G + B) >> 2：
+            // 原来写 77R+150G+29B 被综合成 3 个 24bit 常数乘法器（TD 没用 DSP，全落 LUT），
+            // 综合后出现 slack = -13.931ns 的致命路径（u_sobel_edge/g_reg[*]），并导致
+            // P&R 报 “Abort timing optimization due to too bad SWNS”。
+            // 边缘检测对亮度权重不敏感，这个廉价近似只要 2 个 8bit 加法器。
+            g <= ({1'b0, rgb_in[23:16]} + {rgb_in[15:8], 1'b0} + {1'b0, rgb_in[7:0]}) >> 2;
             de_d <= de;
         end
     end
