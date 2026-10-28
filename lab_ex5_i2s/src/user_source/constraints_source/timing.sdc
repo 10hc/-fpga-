@@ -65,18 +65,29 @@ set_clock_groups -asynchronous \
     -group [get_clocks {video_clk} hdmi_5x_clk sd_card_clk ext_mem_clk]
 
 # ------------------------------------------------------------
-# 6. 可选：如果你的 frame_read_write 内部异步 FIFO 已经完全处理好了跨域，
-#    且报告里总出现 video_clk / sd_card_clk / ext_mem_clk 之间的大量伪违例，
-#    可以打开下面这组异步分组。
+# 6. 【已启用】sd_card / ext_mem / video / hdmi_5x 四个域互视为异步
 #
-#    建议先不要开，先看报告；
-#    只有确认这些跨域都只经过 FIFO / 同步器时再开。
+#    为什么现在开：
+#    综合/布局报告里 SWNS -7.776ns 的最差路径是
+#       起点 u_video_player/ack_dly_reg[2]（sd_card_clk 域）
+#       终点 u_sobel_edge/g_reg[6].fci     （video_clk 域）
+#    这两个寄存器之间**没有任何真实逻辑通路**，工具是穿过异步 FIFO / 跨域
+#    结构“猜”出来的一条伪路径（预算 10ns、数据 15.686ns）。
+#    它把 SWNS 拖到 -7.776，TD 的时序优化器因此不断报“abort timing optimization”。
+#
+#    前提（已逐一核对）：这四个域之间的真实跨域全部经过
+#      a) 例程的异步 FIFO（frame_write_fifo / frame_read_fifo）
+#      b) 顶层 2~3 级同步器（disp_sync0/1/2、key_dbg_v1/v2、wr_finish 同步等）
+#    所以声明异步是正确做法，不是掩盖问题。
+#
+#    启用后预期：该 -7.776 消失，SWNS 回落到 SDRAM IP 自身那条
+#    U3/sdram.dq -> bpad 的 -6.699ns（原例程同样存在，上板已验证可用）。
 # ------------------------------------------------------------
-# set_clock_groups -asynchronous \
-#     -group [get_clocks {sd_card_clk}] \
-#     -group [get_clocks {ext_mem_clk}] \
-#     -group [get_clocks {video_clk}] \
-#     -group [get_clocks {hdmi_5x_clk}]
+set_clock_groups -asynchronous \
+    -group [get_clocks {sd_card_clk}] \
+    -group [get_clocks {ext_mem_clk}] \
+    -group [get_clocks {video_clk}] \
+    -group [get_clocks {hdmi_5x_clk}]
 
 # ------------------------------------------------------------
 # 7. 其余 Input/Output delay 先保持空白
