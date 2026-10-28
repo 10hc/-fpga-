@@ -612,6 +612,9 @@ osd_overlay u_osd_overlay(
     .osd_en  (osd_on),
     .rgb_in  (vout_data_pre),
     .key_dbg (key_dbg_v2),
+    .bri_level (bright_sel),     // 右上信息框：亮度档位
+    .con_level (contrast_sel),   // 右上信息框：对比度档位
+    .shp_on    (cfg_sobel),      // 右上信息框：清晰度（SWKEY1 边缘检测）
     .rgb_out (vout_data_osd)
 );
 
