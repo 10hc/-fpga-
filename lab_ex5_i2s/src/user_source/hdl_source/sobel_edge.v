@@ -56,10 +56,19 @@ module sobel_edge #(
     wire wr1 = de_d && (phase == 2'd1);
     wire wr2 = de_d && (phase == 2'd2);
 
+    // 【关键】三块 RAM 的“写 + 寄存读”必须写在同一个 always 块里，
+    // 且每个数组的读口各自寄存（不能先做多路选择再寄存），否则安路综合器
+    // 认不出 RAM，会退化成分布式 RAM（上一版就是因此占了 3628 个 LUT）。
+    reg [7:0] q0, q1, q2;
     always @(posedge clk) begin
         if (wr0) lb0[x] <= g;
         if (wr1) lb1[x] <= g;
         if (wr2) lb2[x] <= g;
+        if (de_d) begin
+            q0 <= lb0[x];
+            q1 <= lb1[x];
+            q2 <= lb2[x];
+        end
     end
 
     always @(posedge clk or posedge rst) begin
@@ -85,28 +94,9 @@ module sobel_edge #(
         endcase
     end
 
-    reg [7:0] rd1, rd2_comb;
-    always @(*) begin
-        case (rd_p1)
-            2'd0:    rd1 = lb0[x];
-            2'd1:    rd1 = lb1[x];
-            default: rd1 = lb2[x];
-        endcase
-        case (rd_p2)
-            2'd0:    rd2_comb = lb0[x];
-            2'd1:    rd2_comb = lb1[x];
-            default: rd2_comb = lb2[x];
-        endcase
-    end
-
-    // 块 RAM 输出寄存（这一拍 r1_q/r2_q 才是“同一列、上一行/上两行”的像素）
-    reg [7:0] r1_q, r2_q;
-    always @(posedge clk) begin
-        if (de_d) begin
-            r1_q <= rd1;
-            r2_q <= rd2_comb;
-        end
-    end
+    // 寄存后的读值做选择：r1_q = 上一行，r2_q = 上两行（与 q0..q2 同拍）
+    wire [7:0] r1_q = (rd_p1 == 2'd0) ? q0 : (rd_p1 == 2'd1) ? q1 : q2;
+    wire [7:0] r2_q = (rd_p2 == 2'd0) ? q0 : (rd_p2 == 2'd1) ? q1 : q2;
 
     // ---------------- 3) 3×3 窗（与 r1_q/r2_q 对齐）----------------
     reg  [7:0] g_d1;             // 本行 x（与 r1_q 同拍）
