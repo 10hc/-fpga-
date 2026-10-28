@@ -101,25 +101,17 @@ module sobel_edge #(
 
     assign rgb_out = {edge_r, edge_r, edge_r};
 
-    // ---------------- 5) de/vs 延迟对齐（只在 de 有效拍移位 = 按像素计）---------
-    reg [DLY-1:0] de_sr, vs_sr;
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            de_sr <= {DLY{1'b0}};
-            vs_sr <= {DLY{1'b0}};
-        end else if (de) begin
-            de_sr <= {de_sr[DLY-2:0], 1'b1};
-            vs_sr <= {vs_sr[DLY-2:0], vs};
-        end
-    end
-
+    // ---------------- 5) de/vs 输出 ----------------
+    // 这里**不做** 2 行的移位寄存器：上一版用 2×1283 bit = 2566 个触发器，
+    // 直接把 MSlice 顶到 4985 > 4900（超限 85）。边缘图相对原图只错位
+    // “2 行 + 1 像素”，肉眼看不出，所以 de/vs 直接跟随输入，省约 500 个 slice。
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             de_out <= 1'b0;
             vs_out <= 1'b0;
         end else begin
-            de_out <= de_sr[DLY-1];
-            vs_out <= vs_sr[DLY-1];
+            de_out <= de;
+            vs_out <= vs;
         end
     end
 
