@@ -1,17 +1,19 @@
 // -----------------------------------------------------------------------------
 // sobel_edge.v —— 3×3 Sobel 边缘检测（经典算子），带 enable
 //   · 输入 24bit RGB 像素流（de/vs 同步），输出 8bit 灰度边缘图（{E,E,E}）
-//   · 用两条行缓冲（640×8，LUTRAM）构成 3×3 窗口
-//   · 输出与输入之间有固定延迟 = 2 行 + 3 像素，de/vs 用等长移位寄存器对齐
+//   · 三条行缓冲（640×8，**块 RAM**）构成 3×3 窗口
+//     —— 三缓冲（而不是两缓冲）是为了彻底避开“读写同一块 RAM、依赖 read-first
+//        语义”的隐患：写第 p 块、读第 p+1/p+2 块，永不冲突。
+//   · 块 RAM 读出多一拍寄存 → 数据通路上多一级流水；灰度窗口 reg 同步后移一拍，
+//     3×3 窗的九个数仍然严格对齐（见下面的注释图）
 //   · enable 由上层做“旁路选择”：本模块永远算，关掉时上层直接走原图，
 //     这样两种模式都不破坏时序对齐（切换瞬间会有约 2 行的过渡，可接受）
-// 资源估算：约 300 LUT + 2×640×8 LUTRAM + 约 1300 移位寄存器
+// 资源估算：约 350 LUT + 3×640×8 BRAM（≈2 个 9K）+ 少量寄存器
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
 module sobel_edge #(
-    parameter integer WIDTH = 640,
-    parameter integer DLY   = 1283      // = 2*WIDTH + 3（2 行 + 3 像素）
+    parameter integer WIDTH = 640
 )(
     input               clk,
     input               rst,
@@ -23,7 +25,7 @@ module sobel_edge #(
     output     [23:0]   rgb_out
 );
 
-    // ---------------- 1) RGB → 灰度 Y = (77R + 150G + 29B) >> 8 ----------------
+    // ---------------- 1) RGB → 灰度 Y = (R + 2G + B) >> 2 ----------------
     reg  [7:0] g;
     reg        de_d;
     always @(posedge clk or posedge rst) begin
@@ -34,65 +36,107 @@ module sobel_edge #(
             // 灰度用最省的 (R + 2G + B) >> 2：
             // 原来写 77R+150G+29B 被综合成 3 个 24bit 常数乘法器（TD 没用 DSP，全落 LUT），
             // 综合后出现 slack = -13.931ns 的致命路径（u_sobel_edge/g_reg[*]），并导致
-            // P&R 报 “Abort timing optimization due to too bad SWNS”。
+            // P&R 报 "Abort timing optimization due to too bad SWNS"。
             // 边缘检测对亮度权重不敏感，这个廉价近似只要 2 个 8bit 加法器。
-            g <= ({1'b0, rgb_in[23:16]} + {rgb_in[15:8], 1'b0} + {1'b0, rgb_in[7:0]}) >> 2;
+            g    <= ({1'b0, rgb_in[23:16]} + {rgb_in[15:8], 1'b0} + {1'b0, rgb_in[7:0]}) >> 2;
             de_d <= de;
         end
     end
 
-    // ---------------- 2) 两条行缓冲 + 行内地址 ----------------
-    reg  [7:0] lb0 [0:WIDTH-1];
-    reg  [7:0] lb1 [0:WIDTH-1];
-    reg        phase;          // 本行写哪个缓冲
-    reg  [9:0] x;              // 行内像素计数
+    // ---------------- 2) 三条行缓冲（块 RAM）+ 行内地址 ----------------
+    (* syn_ramstyle = "block_ram" *) reg [7:0] lb0 [0:WIDTH-1];
+    (* syn_ramstyle = "block_ram" *) reg [7:0] lb1 [0:WIDTH-1];
+    (* syn_ramstyle = "block_ram" *) reg [7:0] lb2 [0:WIDTH-1];
+
+    reg  [1:0] phase;             // 本行写哪一块（0/1/2 轮转）
+    reg  [9:0] x;                 // 行内像素计数
+    reg  [1:0] rd_p1, rd_p2;      // 读 y-1 / y-2 的块号
+
+    wire wr0 = de_d && (phase == 2'd0);
+    wire wr1 = de_d && (phase == 2'd1);
+    wire wr2 = de_d && (phase == 2'd2);
+
+    always @(posedge clk) begin
+        if (wr0) lb0[x] <= g;
+        if (wr1) lb1[x] <= g;
+        if (wr2) lb2[x] <= g;
+    end
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            phase <= 1'b0;
+            phase <= 2'd0;
             x     <= 10'd0;
         end else if (de_d) begin
             if (x == WIDTH-1) begin
                 x     <= 10'd0;
-                phase <= ~phase;
+                phase <= (phase == 2'd2) ? 2'd0 : phase + 2'd1;
             end else begin
                 x <= x + 10'd1;
             end
-            if (phase) lb1[x] <= g;
-            else       lb0[x] <= g;
         end
     end
 
-    // 组合读：写口正在写 x，读口读到的仍是上一行的旧值 → 正好是 y-2
-    wire [7:0] r_m1 = phase ? lb0[x] : lb1[x];   // y-1
-    wire [7:0] r_m2 = phase ? lb1[x] : lb0[x];   // y-2（旧值）
+    // 读口：本行写 phase，则 y-1 在 phase+1、y-2 在 phase+2
+    always @(*) begin
+        case (phase)
+            2'd0:    begin rd_p1 = 2'd1; rd_p2 = 2'd2; end
+            2'd1:    begin rd_p1 = 2'd2; rd_p2 = 2'd0; end
+            default: begin rd_p1 = 2'd0; rd_p2 = 2'd1; end
+        endcase
+    end
 
-    // ---------------- 3) 3×3 窗（以 x-1 为中心）----------------
-    reg  [7:0] c1, c2;          // 本行:  x-1, x-2
-    reg  [7:0] m1a, m1b;        // y-1 行: x-1, x-2
-    reg  [7:0] m2a, m2b;        // y-2 行: x-1, x-2
+    reg [7:0] rd1, rd2_comb;
+    always @(*) begin
+        case (rd_p1)
+            2'd0:    rd1 = lb0[x];
+            2'd1:    rd1 = lb1[x];
+            default: rd1 = lb2[x];
+        endcase
+        case (rd_p2)
+            2'd0:    rd2_comb = lb0[x];
+            2'd1:    rd2_comb = lb1[x];
+            default: rd2_comb = lb2[x];
+        endcase
+    end
+
+    // 块 RAM 输出寄存（这一拍 r1_q/r2_q 才是“同一列、上一行/上两行”的像素）
+    reg [7:0] r1_q, r2_q;
+    always @(posedge clk) begin
+        if (de_d) begin
+            r1_q <= rd1;
+            r2_q <= rd2_comb;
+        end
+    end
+
+    // ---------------- 3) 3×3 窗（与 r1_q/r2_q 对齐）----------------
+    reg  [7:0] g_d1;             // 本行 x（与 r1_q 同拍）
+    reg  [7:0] c1, c2;           // 本行 x-1, x-2
+    reg  [7:0] m1a, m1b;         // y-1 行 x-1, x-2
+    reg  [7:0] m2a, m2b;         // y-2 行 x-1, x-2
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
+            g_d1 <= 8'd0;
             c1 <= 8'd0; c2 <= 8'd0;
             m1a <= 8'd0; m1b <= 8'd0;
             m2a <= 8'd0; m2b <= 8'd0;
         end else if (de_d) begin
-            c1  <= g;     c2  <= c1;
-            m1a <= r_m1;  m1b <= m1a;
-            m2a <= r_m2;  m2b <= m2a;
+            g_d1 <= g;
+            c1   <= g_d1;  c2 <= c1;
+            m1a  <= r1_q;  m1b <= m1a;
+            m2a  <= r2_q;  m2b <= m2a;
         end
     end
 
     // ---------------- 4) Sobel ------------------------------------------------
-    // 窗口（任意一致的行序即可，|Gx|+|Gy| 与方向无关）：
-    //   p00 p01 p02     c2  c1  g
-    //   p10 p11 p12  =  m1b m1a r_m1
-    //   p20 p21 p22     m2b m2a r_m2
-    wire [9:0] gx_raw = {2'b00, c2} + {1'b0, c1, 1'b0} + {2'b00, g}
-                     - ({2'b00, m2b} + {1'b0, m2a, 1'b0} + {2'b00, r_m2});
+    // 九个数（同一拍，严格对齐）：
+    //   p00 p01 p02     c2   c1    g_d1      ← 本行   y
+    //   p10 p11 p12  =  m1b  m1a   r1_q      ← 上一行 y-1
+    //   p20 p21 p22     m2b  m2a   r2_q      ← 上两行 y-2
+    wire [9:0] gx_raw = {2'b00, c2} + {1'b0, c1, 1'b0} + {2'b00, g_d1}
+                     - ({2'b00, m2b} + {1'b0, m2a, 1'b0} + {2'b00, r2_q});
     wire [9:0] gy_raw = {2'b00, m2b} + {1'b0, m1b, 1'b0} + {2'b00, c2}
-                     - ({2'b00, r_m2} + {1'b0, r_m1, 1'b0} + {2'b00, g});
+                     - ({2'b00, r2_q} + {1'b0, r1_q, 1'b0} + {2'b00, g_d1});
 
     wire [9:0] mag = (gx_raw[9] ? ~gx_raw + 10'd1 : gx_raw)
                    + (gy_raw[9] ? ~gy_raw + 10'd1 : gy_raw);
@@ -101,15 +145,16 @@ module sobel_edge #(
     reg [7:0] edge_r;
     always @(posedge clk or posedge rst) begin
         if (rst) edge_r <= 8'd0;
-        else if (de_d) edge_r <= edge_mag;
+        // 每行最前面 3 个像素的窗口会跨行（左邻取到上一行末尾），会画出一条竖线，
+        // 这里直接压黑，省得屏幕上出现一道贴边的亮线。
+        else if (de_d) edge_r <= (x < 10'd3) ? 8'd0 : edge_mag;
     end
 
     assign rgb_out = {edge_r, edge_r, edge_r};
 
     // ---------------- 5) de/vs 输出 ----------------
-    // 这里**不做** 2 行的移位寄存器：上一版用 2×1283 bit = 2566 个触发器，
-    // 直接把 MSlice 顶到 4985 > 4900（超限 85）。边缘图相对原图只错位
-    // “2 行 + 1 像素”，肉眼看不出，所以 de/vs 直接跟随输入，省约 500 个 slice。
+    // 不做多级移位寄存器：块 RAM 读出多一拍后，边缘图相对原图只错位
+    // “2 行 + 3 像素”，肉眼看不出，所以 de/vs 直接跟随输入，省触发器。
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             de_out <= 1'b0;
