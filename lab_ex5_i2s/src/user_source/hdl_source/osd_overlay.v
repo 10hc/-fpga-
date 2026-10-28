@@ -25,7 +25,7 @@ module osd_overlay #(
     parameter integer PX0         = 552,   // 右上信息框左边界（640-8-80）
     parameter integer PY0         = 8,     // 右上信息框上边界
     parameter integer PW          = 80,    // 信息框宽
-    parameter integer PH          = 80     // 信息框高
+    parameter integer PH          = 56     // 信息框高（两行：亮度 / 对比度）
 )(
     input  wire        clk,
     input  wire        rst,
@@ -150,6 +150,8 @@ module osd_overlay #(
     end
     // 第一行第 3 格留空（"亮度" 只有两个字）
     wire        pblank = (prow == 2'd0) && (pcol == 3'd2);
+    // 信息框只保留两行（亮度 / 对比度）；第三行区域不再画字
+    wire        panel_row_ok = (prow != 2'd2);
 
     // ---------- 汉字字模 ROM：192 x 16（12 字模 x 16 行）----------
     (* syn_ramstyle = "block_ram" *) reg [15:0] cjk_rom [0:191];
@@ -358,12 +360,14 @@ module osd_overlay #(
     reg        dbg_d, dbg_val_d;
     reg [2:0]  col_d;
     reg        panel_d, panel_border_d, panel_blank_d, panel_gl_d;
+    reg        panel_row_ok_d;
     reg [3:0]  pbit_d;
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             rgb_d <= 24'd0; de_d <= 1'b0; text_d <= 1'b0; box_d <= 1'b0;
             osd_d <= 1'b0; col_d <= 3'd0; dbg_d <= 1'b0; dbg_val_d <= 1'b0;
             panel_d <= 1'b0; panel_border_d <= 1'b0; panel_blank_d <= 1'b0;
+            panel_row_ok_d <= 1'b1;
             panel_gl_d <= 1'b0; pbit_d <= 4'd0;
         end else begin
             rgb_d          <= rgb_in;
@@ -378,6 +382,7 @@ module osd_overlay #(
             panel_border_d <= pborder;
             panel_blank_d  <= pblank;
             panel_gl_d     <= in_glyph;
+            panel_row_ok_d <= panel_row_ok;
             pbit_d         <= pbit;
         end
     end
@@ -387,7 +392,7 @@ module osd_overlay #(
 
     assign rgb_out = (de_d && dbg_d)                              ? (dbg_val_d ? 24'hFF0000 : 24'h00FF00) :
                      (de_d && panel_d && panel_border_d)           ? 24'hFFFFFF :
-                     (de_d && panel_d)                             ? ((panel_gl_d && !panel_blank_d && cjk_on)
+                     (de_d && panel_d)                             ? ((panel_gl_d && !panel_blank_d && panel_row_ok_d && cjk_on)
                                                                       ? 24'hFFFFFF : 24'h000000) :
                      (osd_d && de_d && text_d && glyph_on)         ? 24'hFFFFFF :
                      (osd_d && de_d && box_d)                      ? 24'h000000 :
