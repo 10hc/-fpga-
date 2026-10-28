@@ -54,7 +54,7 @@ module video_player #(
     // ---------------- 常量 ----------------
     localparam [3:0]  GROUP_SEC  = 4'd5;
     localparam [10:0] GROUP_PX   = 11'd1280;
-    localparam [1:0]  GROUP_LINE = 2'd4;
+    localparam [2:0]  GROUP_LINE = 3'd4;
     localparam [8:0]  GROUPS     = 9'd60;
     localparam [8:0]  SRC_W_LAST = SRC_W - 1;      // 319
 
@@ -320,7 +320,7 @@ module video_player #(
                                 o_row <= 1'b1;                 // 同一行再发一遍（垂直 2 倍）
                             end else begin
                                 o_row <= 1'b0;
-                                if (o_sl == GROUP_LINE - 2'd1) begin
+                                if (o_sl == GROUP_LINE - 3'd1) begin
                                     grp_grp <= grp_grp + 9'd1;
                                     if (grp_grp + 9'd1 >= GROUPS) begin
                                         st <= S_WAIT;          // 整帧发完
