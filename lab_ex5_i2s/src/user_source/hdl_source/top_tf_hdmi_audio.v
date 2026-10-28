@@ -565,16 +565,52 @@ video_adjust u_video_adjust(
     .rgb_out     (vout_data_adj)
 );
 
+// ===== 拨码开关 SWKEY1~4：四路算法硬开关（2 拍同步进视频域）=====
+// 板上是“上拉 + 开关接地”：拨到 ON 读到 0 → 取反当使能
+reg [3:0] swk_v1, swk_v2;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        swk_v1 <= 4'd0;
+        swk_v2 <= 4'd0;
+    end else begin
+        swk_v1 <= {swkey4, swkey3, swkey2, swkey1};
+        swk_v2 <= swk_v1;
+    end
+end
+wire cfg_sobel    = ~swk_v2[0];   // SWKEY1: Sobel 边缘检测
+wire cfg_heq      = ~swk_v2[1];   // SWKEY2: 直方图均衡（预留）
+wire cfg_blur     = ~swk_v2[2];   // SWKEY3: 高斯模糊（预留）
+wire cfg_bilinear = ~swk_v2[3];   // SWKEY4: 双线性放大（预留）
+
+// ===== Sobel 边缘检测（经典 3×3 算子，可旁路）=====
+wire [23:0] vout_data_sob;
+wire        de_sob, vs_sob;
+sobel_edge #(.WIDTH(640), .DLY(1283)) u_sobel_edge(
+    .clk     (video_clk),
+    .rst     (rst_all),
+    .de      (de),
+    .vs      (vs),
+    .rgb_in  (vout_data_adj),
+    .de_out  (de_sob),
+    .vs_out  (vs_sob),
+    .rgb_out (vout_data_sob)
+);
+
+// 旁路选择：关掉时数据与 de/vs 一起走原路径，两种模式都不会错位
+wire [23:0] vout_data_pre = cfg_sobel ? vout_data_sob : vout_data_adj;
+wire        de_pre        = cfg_sobel ? de_sob        : de;
+wire        vs_pre        = cfg_sobel ? vs_sob        : vs;
+
 wire osd_on = 1'b1;   // OSD 文字常开
 
 wire [23:0] vout_data_osd;
 osd_overlay u_osd_overlay(
     .clk     (video_clk),
     .rst     (rst_all),
-    .de      (de),
-    .vs      (vs),
+    .de      (de_pre),
+    .vs      (vs_pre),
     .osd_en  (osd_on),
-    .rgb_in  (vout_data_adj),
+    .rgb_in  (vout_data_pre),
     .key_dbg (key_dbg_v2),
     .rgb_out (vout_data_osd)
 );
@@ -586,8 +622,8 @@ always @(posedge video_clk or posedge rst_all) begin
         de_d1 <= 1'b0;
         vs_d1 <= 1'b0;
     end else begin
-        de_d1 <= de;
-        vs_d1 <= vs;
+        de_d1 <= de_pre;
+        vs_d1 <= vs_pre;
     end
 end
 
