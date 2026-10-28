@@ -526,6 +526,10 @@ always @(posedge clk or posedge rst) begin
     end
 end
 
+// 【看门狗强拆的收尾】被强拆的一方要补一个合成 end，并且残留字节谁也不给（见下面仲裁器段）
+reg wd_own_wav, wd_own_fat, wd_own_bmp;   // 强拆瞬间的事务归属
+reg wd_flush;                             // 强拆后屏蔽残留字节，直到下一次 read_end
+
 fat32_scan #(
     .MAX_BMP_COUNT (3'd4)
 ) u_fat32_scan (
@@ -540,8 +544,8 @@ fat32_scan #(
     .sd_req         (fat_req),
     .sd_addr        (fat_addr),
     .sd_data        (sd_sec_read_data),
-    .sd_data_valid  (sd_sec_read_data_valid & fat_sel),
-    .sd_end         (sd_sec_read_end & fat_sel),
+    .sd_data_valid  (sd_sec_read_data_valid & fat_sel & ~wd_flush),
+    .sd_end         ((sd_sec_read_end & fat_sel) | wd_own_fat),
     .bmp_count      (fat_bmp_count),
     .bmp_sector0    (fat_bmp_sector0),
     .bmp_sector1    (fat_bmp_sector1),
@@ -580,6 +584,44 @@ reg  [23:0] bus_wd;
 localparam [23:0] BUS_WD_MAX = 24'd1_000_000;   // 10ms @100MHz
 wire bus_wd_fire = (bus_wd >= BUS_WD_MAX);
 
+// 强拆后的“悬停”：旧事务还在控制器里跑，谁都不许再开新事务；悬停超时兜底
+reg  [25:0] drain_wd;
+localparam [25:0] DRAIN_WD_MAX = 26'd6_000_000; // 60ms @100MHz
+
+// 【2026-10-28 修·根因】看门狗强拆一个仍在传输中的事务时，被拆的那一方会【丢掉 read_end】：
+// 旧代码在同一拍把 fat_grant/granted_wav 清 0，而 *_sec_read_end 的门控正是
+// `sd_sec_read_end & granted_wav` → end 被 &0 吃掉。wav_audio 收不到 end 就不做
+// “addr+1 / data_left-=512”，只能等自己的 20ms 超时再重发【同一个扇区】；
+// 而卡/控制器里那一拍的旧数据随后还会到达 → 被当成新块的起始字节拼进环形缓冲，
+// 于是样本流从此变成“整块重复 + 半帧错位”的乱码 = 上板那种从头到尾的沙沙/嗡嗡噪音。
+// 这里做两件事：
+//   (1) 给“被强拆的那一方”补一个【合成 end】（1 拍），保证它的地址/计数照常前进；
+//   (2) 从强拆到旧事务真正收尾（sd_sec_read_end）之间保持 wd_flush=1：
+//       —— 数据/end 全部屏蔽（残留字节谁也不给，杜绝串台）
+//       —— 仲裁器悬停（不许开新事务，否则新事务的地址会被卡住的旧事务用掉）
+// 这样一次卡顿的代价只是“丢一块（几十毫秒静音空洞）”，而不是整条音频流变噪音。
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        wd_own_wav <= 1'b0;
+        wd_own_fat <= 1'b0;
+        wd_own_bmp <= 1'b0;
+        wd_flush   <= 1'b0;
+        drain_wd   <= 26'd0;
+    end else begin
+        wd_own_wav <= bus_wd_fire &  granted_wav;
+        wd_own_fat <= bus_wd_fire &  fat_grant;
+        wd_own_bmp <= bus_wd_fire & ~granted_wav & ~fat_grant;
+        if (bus_wd_fire)               wd_flush <= 1'b1;      // 进入悬停
+        else if (sd_sec_read_end)      wd_flush <= 1'b0;      // 旧事务收尾，解除
+        else if (drain_wd >= DRAIN_WD_MAX) wd_flush <= 1'b0;  // 兜底：旧事务彻底不回来
+        if (!wd_flush)                 drain_wd <= 26'd0;
+        else                           drain_wd <= drain_wd + 26'd1;
+    end
+end
+
+// 悬停期间不开新事务
+wire arb_hold = wd_flush;
+
 always @(posedge clk or posedge rst) begin
     if (rst) bus_wd <= 24'd0;
     else if (!sec_busy || sd_sec_read_end) bus_wd <= 24'd0;
@@ -592,7 +634,7 @@ always @(posedge clk or posedge rst) begin
         fat_grant   <= 1'b0;
         sec_busy    <= 1'b0;
         bmp_streak  <= 4'd0;
-    end else if (!sec_busy) begin
+    end else if (!sec_busy && !arb_hold) begin
         // 总线空闲：一拍内决定下一个事务归谁，并立刻置 busy 锁死
         if (fat_req && !locate_to) begin
             // 目录解析优先级最高：只在启动阶段跑，且超时后彻底放弃（locate_to）
@@ -632,22 +674,26 @@ end
 // 于是出现“音频被授权、却收到图像扇区的字节” → WAV 从头就是噪音；
 // 图像侧只是少读一次、它会重发同一地址，所以图像看起来完全正常。
 // 现在改成用组合授权选地址：授权/请求/地址三者永远同拍、同主。
-wire fat_req_eff   = fat_req & ~locate_to;
-wire want_wav_now  = wav_sec_read & (bmp_streak >= WAV_QUOTA || !bmp_sec_read);
+wire fat_req_eff   = fat_req & ~locate_to & ~arb_hold;
+wire want_wav_now  = wav_sec_read & (bmp_streak >= WAV_QUOTA || !bmp_sec_read) & ~arb_hold;
 wire grant_fat_now = sec_busy ? fat_grant   : fat_req_eff;
 wire grant_wav_now = sec_busy ? granted_wav : (fat_req_eff ? 1'b0 : want_wav_now);
 
-assign sd_sec_read      = grant_fat_now ? fat_req : (grant_wav_now ? wav_sec_read      : bmp_sec_read);
-assign sd_sec_read_addr = grant_fat_now ? fat_addr : (grant_wav_now ? wav_sec_read_addr : bmp_sec_read_addr);
+// 悬停期间（arb_hold）总线不发请求：否则 mux 会落到默认支路（图像）上，控制器从卡住的
+// 旧事务里回来后可能把图像的地址当成“已授权”再锁一次。
+assign sd_sec_read      = arb_hold ? 1'b0 :
+                          (grant_fat_now ? fat_req : (grant_wav_now ? wav_sec_read      : bmp_sec_read));
+assign sd_sec_read_addr = arb_hold ? 32'd0 :
+                          (grant_fat_now ? fat_addr : (grant_wav_now ? wav_sec_read_addr : bmp_sec_read_addr));
 
-// 数据只回送给被授权的一方
+// 数据只回送给被授权的一方；看门狗强拆后到下一次 read_end 之间一律屏蔽（旧事务残留字节）
 assign bmp_sec_read_data       = sd_sec_read_data;
-assign bmp_sec_read_data_valid = sd_sec_read_data_valid & ~granted_wav & ~fat_sel;
-assign bmp_sec_read_end        = sd_sec_read_end        & ~granted_wav & ~fat_sel;
+assign bmp_sec_read_data_valid = sd_sec_read_data_valid & ~granted_wav & ~fat_sel & ~wd_flush;
+assign bmp_sec_read_end        = (sd_sec_read_end & ~granted_wav & ~fat_sel) | wd_own_bmp;
 
 assign wav_sec_read_data       = sd_sec_read_data;
-assign wav_sec_read_data_valid = sd_sec_read_data_valid & granted_wav & ~fat_sel;
-assign wav_sec_read_end        = sd_sec_read_end        & granted_wav & ~fat_sel;
+assign wav_sec_read_data_valid = sd_sec_read_data_valid & granted_wav & ~fat_sel & ~wd_flush;
+assign wav_sec_read_end        = (sd_sec_read_end & granted_wav & ~fat_sel) | wd_own_wav;
 
 sd_card_top sd_card_top_m0(
     .clk                    (clk),

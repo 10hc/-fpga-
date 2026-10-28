@@ -70,6 +70,10 @@ module wav_audio #(
     reg [7:0]   r_low;               // 右声道低字节
     reg         streaming;
     reg [24:0]  to_cnt;   // S_STR_DAT 超时计数（看门狗强拆事务时自恢复）
+    reg         draining; // 超时后丢弃本块剩余字节、等 end 收尾（避免整块重复+半帧错位）
+    // 【2026-10-28 修·只收“完整块”】每个扇区开始前记下写指针，块不完整（被强拆/超时/字节数≠512）
+    //   就回滚到块首，绝不把半块样本留在缓冲里 —— 半块是“从第一个音符起就沙沙响”的直接成因。
+    reg [8:0]   wrp_blk;
     reg [31:0]  data_left;           // 剩余数据字节（循环用）
     reg [31:0]  data_start;
 
@@ -100,6 +104,9 @@ module wav_audio #(
             streaming     <= 1'b0;
             data_left     <= 32'd0;
             data_start    <= 32'd0;
+            draining      <= 1'b0;
+            wrp_blk       <= 9'd0;
+            to_cnt        <= 25'd0;
             wrp <= 9'd0;
             // 注意：rdp 只在下面"48kHz 节拍 + 握手"那个 always 块里驱动
             //      （包括它的复位），否则综合器会报 multiple drivers
@@ -170,13 +177,15 @@ module wav_audio #(
                         sec_read_addr <= addr;
                         byte_cnt      <= 10'd0;
                         to_cnt        <= 25'd0;
+                        draining      <= 1'b0;
+                        wrp_blk       <= wrp;              // 记下块首，块不完整就回滚
                         st            <= S_STR_DAT;
                     end
                 end
 
                 // ---------- 流式：收数据并组装样本 ----------
                 S_STR_DAT: begin
-                    if (sec_read_data_valid) begin
+                    if (sec_read_data_valid && !draining) begin
                         case (byte_cnt[1:0])
                             2'd0: l16[7:0]  <= sec_read_data;
                             2'd1: l16[15:8] <= sec_read_data;
@@ -188,20 +197,32 @@ module wav_audio #(
                         endcase
                         byte_cnt <= byte_cnt + 10'd1;
                     end
-                    // 【2026-10-26 修】总线看门狗强拆事务时 sec_read_end 会丢，本状态原没有超时，
-                    // 会一直等下去且 byte_cnt 不复位 → 下次重发同一扇区时 4 字节组相位错开，
-                    // 拼出的样本全是乱码 = 持续沙沙噪音。这里加超时并复位字节相位。
+                    // 【2026-10-28 修·根因】超时后不再“原地重发同一个扇区”，而是进入 drain：
+                    //   把这一块剩下的字节全部丢弃、等它真正的 end 来收尾（地址/计数照常前进），
+                    //   否则旧块的尾巴会以 byte_cnt=0 的身份被拼成新块的开头 → 整块重复 + 半帧错位
+                    //   = 从头到尾的沙沙噪音。sd_card_bmp 侧已保证被强拆的主一定能拿到 end。
                     if (sec_read_data_valid) to_cnt <= 25'd0;
-                    else if (to_cnt >= 25'd2_000_000) begin   // 20ms @100MHz，长于总线看门狗 10ms
+                    else if (!draining && to_cnt >= 25'd2_000_000) begin  // 20ms @100MHz
+                        draining <= 1'b1;                 // 不再收字节，等 end
+                        wrp      <= wrp_blk;              // 半块样本整体丢弃（不留噪音）
+                        l16      <= 16'd0;                // 丢弃半帧
+                        r_low    <= 8'd0;
+                        to_cnt   <= 25'd0;
+                    end else if (draining && to_cnt >= 25'd4_000_000) begin
+                        // 40ms 还没等到 end：卡真的不回了，强制重同步（相位归零，重发同一扇区）
+                        draining <= 1'b0;
                         sec_read <= 1'b0;
                         byte_cnt <= 10'd0;
                         l16      <= 16'd0;
                         r_low    <= 8'd0;
                         to_cnt   <= 25'd0;
-                        st       <= S_STR_REQ;                // 重新请求同一扇区
+                        st       <= S_STR_REQ;
                     end else to_cnt <= to_cnt + 25'd1;
                     if (sec_read_end) begin
                         sec_read <= 1'b0;
+                        draining <= 1'b0;                 // 收尾完成，恢复正常接收
+                        if (byte_cnt != 10'd512) wrp <= wrp_blk;  // 字节数不对 → 整块丢弃
+                        byte_cnt <= 10'd0;
                         if (data_left <= 32'd512) begin
                             addr      <= data_start;      // 循环回开头
                             data_left <= (hdr[351:320] > 32'd468)
