@@ -561,10 +561,38 @@ end
 //   [2] 方块6 sd_locate_error（红=解析报错）
 //   [1] 方块7 wav_file_valid（红=目录里认出了 A1.WAV；WAV 走“目录给的首扇区”）
 //   [0] 方块8 wav_sum_ok（临时诊断：红=从卡读回的前 4 扇区字节与 PC 端一致；绿=取数错误）
+// ---- 视频模式诊断：锁存“曾经到过”的里程碑（绿=到过，红=从没到过）----
+// 方块从左到右 = [7]..[0]：
+//   [7] 目录认出了 VIDEO.VID（vid_file_valid）
+//   [6] 播放器启动过（st != S_IDLE）
+//   [5] 从卡里读到过字节（sec_read_data_valid）
+//   [4] 到过 S_GRP（整组整组搬扇区）
+//   [3] 到过 S_WAIT（整帧 60 组都发完了，在等写完成）
+//   [2] 到过 S_PACE（写完成回来了 → 帧真的写进 SDRAM 了）★最关键
+//   [1] display_valid 起来过（有帧提交上屏）
+//   [0] 视频写请求被 frame_fifo_write 应答过（wr_req_ack）
+// 判读：从左往右第一个红格就是卡住的位置。
+reg dv_file, dv_go, dv_data, dv_grp, dv_wait, dv_pace, dv_disp, dv_ack;
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all) begin
+        dv_file <= 1'b0; dv_go   <= 1'b0; dv_data <= 1'b0; dv_grp  <= 1'b0;
+        dv_wait <= 1'b0; dv_pace <= 1'b0; dv_disp <= 1'b0; dv_ack  <= 1'b0;
+    end else begin
+        if (vid_file_valid)          dv_file <= 1'b1;
+        if (vid_st_dbg != 4'd0)      dv_go   <= 1'b1;
+        if (vid_sec_read_data_valid) dv_data <= 1'b1;
+        if (vid_st_dbg == 4'd3)      dv_grp  <= 1'b1;   // S_GRP
+        if (vid_st_dbg == 4'd5)      dv_wait <= 1'b1;   // S_WAIT
+        if (vid_st_dbg == 4'd6)      dv_pace <= 1'b1;   // S_PACE（只有 wr_finish 到了才会进）
+        if (vid_display_valid)       dv_disp <= 1'b1;
+        if (video_mode && sd_card_write_req_ack) dv_ack <= 1'b1;
+    end
+end
+
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
-    // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
-    ? { vid_display_valid, 1'b1, vid_active, 1'b0, vid_st_dbg[3:0] }
+    // 视频模式：里程碑锁存图（红=0/没到过，绿=1/到过）
+    ? { dv_file, dv_go, dv_data, dv_grp, dv_wait, dv_pace, dv_disp, dv_ack }
     : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_sum_ok };
 wire [7:0] key_dbg = dbg_sel;
 
