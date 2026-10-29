@@ -87,7 +87,7 @@ module video_player #(
     reg [8:0]  o_px;
     reg        o_dup;
     reg        o_row;
-    reg        o_div;
+    reg [1:0]  o_div;
 
     reg [31:0] pace_acc;        // 帧率累加器（避免除法器）
     reg [23:0] wait_cnt;        // S_WAIT 兜底计数（写完成脉冲丢失时不至于僵死）
@@ -187,7 +187,7 @@ module video_player #(
             o_px          <= 9'd0;
             o_dup         <= 1'b0;
             o_row         <= 1'b0;
-            o_div         <= 1'b0;
+            o_div         <= 2'd0;
             wr_req_set    <= 1'b0;
             wr_en         <= 1'b0;
             wr_data       <= 32'd0;
@@ -262,7 +262,7 @@ module video_player #(
                     o_px          <= 9'd0;
                     o_dup         <= 1'b0;
                     o_row         <= 1'b0;
-                    o_div         <= 1'b0;
+                    o_div         <= 2'd0;
                     wr_buf        <= wr_buf + 2'd1;
                     write_buf_idx <= wr_buf + 2'd1;
                     wr_req_set    <= 1'b1;
@@ -300,7 +300,7 @@ module video_player #(
                         o_px    <= 9'd0;
                         o_dup   <= 1'b0;
                         o_row   <= 1'b0;
-                        o_div   <= 1'b0;
+                        o_div   <= 2'd0;
                         st      <= S_OUT;
                     end
                 end
@@ -310,8 +310,8 @@ module video_player #(
             S_OUT: begin
                 if (!wr_ready) begin
                     // 等写通道应答：FIFO 清零还没解除时送进去的像素会被吃掉
-                end else if (o_div == 1'b0) begin
-                    o_div   <= 1'b1;                           // 限速：1 字 / 2 拍
+                end else if (o_div == 2'd0) begin
+                    o_div   <= 2'd1;                           // 限速：1 字 / 4 拍（25M 字/秒，远低于 SDRAM 写带宽，避免写 FIFO 溢出丢字）
                     wr_en   <= 1'b1;
                     wr_data <= {pix888, 8'b0};
 
@@ -342,7 +342,7 @@ module video_player #(
                         end
                     end
                 end else begin
-                    o_div <= 1'b0;
+                    o_div <= o_div + 2'd1;                     // 2->3->0 循环
                 end
             end
 

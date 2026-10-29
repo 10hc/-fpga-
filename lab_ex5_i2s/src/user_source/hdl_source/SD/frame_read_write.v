@@ -94,6 +94,7 @@ wire                                 write_fifo_aclr;            // fifo Asynchr
 
 wire O_wr_busy;
 wire O_rd_busy;
+wire wr_fifo_full;                    // 写 FIFO 满（rdusedw 只有 9 位，512 会绕成 0，必须用满标志判断）
 
 assign App_wr_busy = O_wr_busy;//下个时钟写指令拉高
 assign App_rd_busy = O_rd_busy;//读指令还没有过去十个时钟;因为写指令优先，不需要在意下个时钟是否是读指令
@@ -109,7 +110,7 @@ wfifo_32_32_512 write_buf
 	.re                      	(App_wr_en        		  ),          // Read Request
 	.di                       	(write_data               ),          // Input Data
 	.empty_flag                 (                         ),          // Read side Empty flag
-	.full_flag                  (                         ),          // Write side Full flag
+	.full_flag                  (wr_fifo_full             ),          // Write side Full flag
 	.wrusedw                	(              	  		  ),          // Read Used Words
 	.rdusedw                	(rdusedw                  ),          // Write Used Words
 	.dout                       (App_wr_din		          )
@@ -148,7 +149,8 @@ frame_fifo_write_m0
 	.write_addr_index           (write_addr_index         ),    
 	.write_len                  (write_len                ),
 	.fifo_aclr                  (write_fifo_aclr          ),
-	.rdusedw                 	(rdusedw                  )
+	.rdusedw                 	(rdusedw                  ),
+	.fifo_full                  (wr_fifo_full             )
 );
 
 //instantiate an asynchronous FIFO 

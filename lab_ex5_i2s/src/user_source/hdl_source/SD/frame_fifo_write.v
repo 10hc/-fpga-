@@ -38,7 +38,8 @@ module frame_fifo_write
 	input[1:0]                       write_addr_index,           // select valid base address from write_addr_0 write_addr_1 write_addr_2 write_addr_3
 	input[ADDR_BITS - 1:0]           write_len,                  // data write module write request data length
 	output reg                       fifo_aclr,                  // to fifo asynchronous clear
-	input[9:0]                      rdusedw                     // from fifo read used words
+	input[9:0]                      rdusedw,                    // from fifo read used words
+	input                            fifo_full                   // fifo full flag（rdusedw 是 9 位，满 512 会显示 0，必须靠这个）
 );
 localparam ONE                       = 256'd1;                   //256 bit '1'   you can use ONE[n-1:0] for n bit '1'
 localparam ZERO                      = 256'd0;                   //256 bit '0'
@@ -79,7 +80,10 @@ reg App_wr_en_r;
 reg App_wr_en_d0;
 
 wire into_burst;
-assign into_burst = (((write_len_latch <= (rdusedw + write_cnt))||rdusedw > BURST_SIZE) && ~App_rd_busy);//当rd在突发时不会进入burst
+// 注意 rdusedw 只有 9 位：FIFO 满 512 字时它绕回 0，会把“满”误判成“空”，
+// 导致写通道永远进不了 burst、write_finish 永不到来（视频卡在第一帧的真凶）。
+// 所以这里必须或上 fifo_full。
+assign into_burst = (((write_len_latch <= (rdusedw + write_cnt))||rdusedw > BURST_SIZE||fifo_full) && ~App_rd_busy);//当rd在突发时不会进入burst
 
 assign App_wr_addr = {App_wr_addr_r[ADDR_BITS - 1:0]};
 //assign O_wr_busy = (state != S_IDLE || (S_IDLE && write_req_d2));
