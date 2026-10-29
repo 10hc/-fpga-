@@ -19,12 +19,7 @@ module wav_audio #(
     parameter integer VID_CLK_HZ   = 25_000_000,
     parameter integer SAMPLE_RATE  = 48_000,
     parameter [31:0]  SCAN_START   = 32'd0,
-    parameter [31:0]  SCAN_MAX     = 32'd131071,
-    // 自检音：1 = 不读 SD 数据，在视频域自己产生 1kHz 三角波 + 约 0.7s 通断
-    // 0 = 正常播放 WAV；1 = 输出通路自检音；2 = 缓冲自检（写已知正弦，不读 SD）
-    parameter  [1:0]  SELFTEST     = 2'd0,
-    // 期望校验和：PC 端对卡上文件 data_start 起前 4 扇区(2048B) 求和取低 16 位
-    parameter  [15:0] SUM_EXPECT   = 16'hF5E2
+    parameter [31:0]  SCAN_MAX     = 32'd131071
 )(
     input  wire        sd_clk,
     input  wire        sd_rst,
@@ -47,29 +42,15 @@ module wav_audio #(
     output reg         aud_valid,          // 每个样本 1 拍
     output reg  [23:0] aud_left,
     output reg  [23:0] aud_right,
-    output wire        playing,
-    output reg  [15:0] sum16,          // 前 4 个流式扇区的字节和（冻结）
-    output wire        sum_ok
+    output wire        playing
 );
 
     // ==================== 样本环形缓冲（sd 域，512×32 推断 BRAM）====================
-    // [容错] 4096 样本 = 85.3ms 缓冲（原 512 样本 = 10.7ms）。
-    // 真卡若偶发“整块读延迟 >10ms”，老缓冲会被抽干 → 持续沙沙声；85ms 足以吸收两三次抖动。
-    // 必须推断成块 RAM：512×32 落 LUT 就要 2754 个 LUT4，4096×32 更不可能。
-    reg [31:0] sbuf [0:4095];
-    reg [11:0] wrp, rdp;
-    // SELFTEST==2 时用独立写指针（避免和状态机抢同一个 wrp 造成多驱动）
-    reg [11:0] wrp_cf;
-    reg [15:0] cf_ph;
-    reg [15:0] sum_acc;
-    reg [1:0]  sum_sec;
-    reg [15:0] sec_sum;
-    wire [15:0] cf_s16 = cf_ph[15] ? (16'hFFFF - cf_ph) : cf_ph;   // 1kHz 三角波
-    wire [11:0] wrp_eff = (SELFTEST == 2'd2) ? wrp_cf : wrp;
-    assign sum_ok = (sum16 == SUM_EXPECT);
+    reg [31:0] sbuf [0:511];
+    reg [8:0] wrp, rdp;
 
-    wire [11:0] buf_cnt = wrp_eff - rdp;
-    wire       buf_empty = (wrp_eff == rdp);
+    wire [8:0] buf_cnt = wrp - rdp;
+    wire       buf_empty = (wrp == rdp);
 
     // ==================== 状态机（sd 域）====================
     // 跳转模式下只容忍文件首扇区后 3 个扇区
@@ -92,7 +73,7 @@ module wav_audio #(
     reg         draining; // 超时后丢弃本块剩余字节、等 end 收尾（避免整块重复+半帧错位）
     // 【2026-10-28 修·只收“完整块”】每个扇区开始前记下写指针，块不完整（被强拆/超时/字节数≠512）
     //   就回滚到块首，绝不把半块样本留在缓冲里 —— 半块是“从第一个音符起就沙沙响”的直接成因。
-    reg [11:0]  wrp_blk;
+    reg [8:0]   wrp_blk;
     reg [31:0]  data_left;           // 剩余数据字节（循环用）
     reg [31:0]  data_start;
 
@@ -108,7 +89,7 @@ module wav_audio #(
     // 512 样本 = 10.7ms。**【不要再加大】** 这种小数组 TD 会做成分布式 RAM（吃 LUT/切片），
     // 4096 样本会把 mslice 顶到 6626 > 4900 直接超限；音频不断音靠的是
     // “配额仲裁 + 只在扇区边界让路”，不是靠缓冲深度。
-    wire buf_room = (buf_cnt <= 12'd3967);   // 不允许写满，避免满/空二义
+    wire buf_room = (buf_cnt <= 9'd383);
 
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
@@ -124,13 +105,9 @@ module wav_audio #(
             data_left     <= 32'd0;
             data_start    <= 32'd0;
             draining      <= 1'b0;
-            wrp_blk       <= 12'd0;
+            wrp_blk       <= 9'd0;
             to_cnt        <= 25'd0;
-            sum_acc       <= 16'd0;
-            sec_sum       <= 16'd0;
-            sum_sec       <= 2'd0;
-            sum16         <= 16'd0;
-            wrp <= 12'd0;
+            wrp <= 9'd0;
             // 注意：rdp 只在下面"48kHz 节拍 + 握手"那个 always 块里驱动
             //      （包括它的复位），否则综合器会报 multiple drivers
         end else begin
@@ -201,7 +178,6 @@ module wav_audio #(
                         byte_cnt      <= 10'd0;
                         to_cnt        <= 25'd0;
                         draining      <= 1'b0;
-                        sec_sum       <= 16'd0;
                         wrp_blk       <= wrp;              // 记下块首，块不完整就回滚
                         st            <= S_STR_DAT;
                     end
@@ -210,14 +186,13 @@ module wav_audio #(
                 // ---------- 流式：收数据并组装样本 ----------
                 S_STR_DAT: begin
                     if (sec_read_data_valid && !draining) begin
-                        sec_sum <= sec_sum + {8'd0, sec_read_data};
                         case (byte_cnt[1:0])
                             2'd0: l16[7:0]  <= sec_read_data;
                             2'd1: l16[15:8] <= sec_read_data;
                             2'd2: r_low     <= sec_read_data;
                             2'd3: begin
                                 // 数据写入在模块末尾的专用 always 块里（为了被推断成块 RAM）
-                                wrp <= wrp + 12'd1;
+                                wrp <= wrp + 9'd1;
                             end
                         endcase
                         byte_cnt <= byte_cnt + 10'd1;
@@ -247,12 +222,6 @@ module wav_audio #(
                         sec_read <= 1'b0;
                         draining <= 1'b0;                 // 收尾完成，恢复正常接收
                         if (byte_cnt != 10'd512) wrp <= wrp_blk;  // 字节数不对 → 整块丢弃
-                        // 校验和只累计“完整收到 512 字节”的扇区：超时半块或重读不会污染结果
-                        if (byte_cnt == 10'd512 && sum_sec < 2'd4) begin
-                            sum_acc <= sum_acc + sec_sum;
-                            sum_sec <= sum_sec + 2'd1;
-                            if (sum_sec == 2'd3) sum16 <= sum_acc + sec_sum;
-                        end
                         byte_cnt <= 10'd0;
                         if (data_left <= 32'd512) begin
                             addr      <= data_start;      // 循环回开头
@@ -295,10 +264,10 @@ module wav_audio #(
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
             s_toggle <= 1'b0;
-            rdp      <= 12'd0;                         // rdp 唯一驱动点
+            rdp      <= 9'd0;                         // rdp 唯一驱动点
         end else if (tick) begin
             if (!buf_empty) begin
-                rdp <= rdp + 12'd1;
+                rdp <= rdp + 9'd1;
             end
             // 缓冲空（例如正在给图片加载让路）：保持上一个样本，
             // 节拍照走 —— 给 HDMI 的音频流一旦断供，接收端失锁就是持续噪音。
@@ -314,25 +283,6 @@ module wav_audio #(
         if (vid_rst) vacc <= 32'd0;
         else if (vtick) vacc <= vacc + SAMPLE_RATE - VID_CLK_HZ;
         else            vacc <= vacc + SAMPLE_RATE;
-    end
-
-    // ==================== 自检音（SELFTEST=1 时生效）====================
-    // 用来区分“取数据坏了”还是“输出通路坏了”：
-    //   自检音 = 间断的干净嘟嘟声 → 输出通路 OK，噪音来自 sbuf 里的数据；
-    //   自检音也沙沙响            → 输出通路（vtick/跨域/aud_valid）本身有问题。
-    reg  [15:0] st_ph;
-    reg  [14:0] st_env;
-    wire [15:0] st_tri = st_ph[15] ? (16'hFFFF - st_ph) : st_ph;
-    wire        st_amp = ~st_env[14];
-
-    always @(posedge vid_clk or posedge vid_rst) begin
-        if (vid_rst) begin
-            st_ph  <= 16'd0;
-            st_env <= 15'd0;
-        end else if (vtick) begin
-            st_ph  <= st_ph + 16'd1365;     // 1365/65536 × 48kHz ≈ 1kHz
-            st_env <= st_env + 15'd1;
-        end
     end
 
     // ==================== 音频输出（vid 域）====================
@@ -356,8 +306,8 @@ module wav_audio #(
             end
             // 精确 48kHz 输出，一个节拍都不少
             if (vtick) begin
-                aud_left  <= SELFTEST ? (st_amp ? {st_tri, 8'b0} : 24'd0) : h_l;
-                aud_right <= SELFTEST ? (st_amp ? {st_tri, 8'b0} : 24'd0) : h_r;
+                aud_left  <= h_l;
+                aud_right <= h_r;
                 aud_valid <= 1'b1;
             end else begin
                 aud_valid <= 1'b0;
@@ -379,18 +329,11 @@ module wav_audio #(
             s_l <= 24'd0;
             s_r <= 24'd0;
         end else begin
-            if (SELFTEST == 2'd2) begin
-                // 缓冲自检：用 48kHz 节拍把已知三角波写进缓冲（完全不碰 SD）
-                if (tick && (buf_cnt <= 12'd3967)) begin
-                    sbuf[wrp_cf] <= {cf_s16, cf_s16};
-                    wrp_cf       <= wrp_cf + 12'd1;
-                end
-            end else if (sbuf_we) sbuf[wrp] <= sbuf_din;
-            // 读口不加条件：rdp 只在 48kHz 节拍上推进，两次节拍之间读出的就是同一个样本，
-            // 因此“每拍都读”与原来的“只在 tick 读”完全等价；而综合器要求读口无条件
-            // 才肯推断成块 RAM（上一版加了 if(sbuf_re) 就被判成分布式 RAM）。
-            s_l <= {sbuf[rdp][15:0],  8'b0};              // 16bit → 24bit
-            s_r <= {sbuf[rdp][31:16], 8'b0};
+            if (sbuf_we) sbuf[wrp] <= sbuf_din;
+            if (sbuf_re) begin
+                s_l <= {sbuf[rdp][15:0],  8'b0};      // 16bit → 24bit
+                s_r <= {sbuf[rdp][31:16], 8'b0};
+            end
         end
     end
 

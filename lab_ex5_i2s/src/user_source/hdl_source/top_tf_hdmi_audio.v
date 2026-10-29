@@ -101,7 +101,6 @@ wire        wav_valid;
 wire [23:0] wav_left_data;
 wire [23:0] wav_right_data;
 wire        wav_playing;
-wire        wav_sum_ok;          // WAV 前 4 扇区字节校验和比对结果（临时诊断）
 wire        wav_sec_read;
 wire [31:0] wav_sec_read_addr;
 wire [7:0]  wav_sec_read_data;
@@ -433,11 +432,7 @@ wire switch_pulse = (~video_mode) && (disp_sync2 != disp_sync1);
 // 【重要】转场特效暂时关闭：读地址走转场逻辑时，切图后整屏会变成灰黑乱码
 // （已用仿真确认转场地址序列本身正确，问题在参数/回收时序，需要专门再调）。
 // 关掉后切图就是干净的缓冲区切换。等基础显示彻底稳定后把这里改回 1'b1 再继续调特效。
-// 转场效果总开关：1 = 短按 KEY2 切图时播放转场（滑入/栅格/淡入淡出依次轮换）
-// 转场特效总开关：1=启用（滑入→栅格→淡入淡出轮换），0=关闭（原始直通）。
-    // 上板实测：打开后视频模式拿不到图（长按 KEY2 背景变蓝、视频不出），先关闭保证稳定；
-    // 待逐效果定位后再打开。
-    localparam TRANS_EFFECT_ENABLE = 1'b0;
+localparam TRANS_EFFECT_ENABLE = 1'b0;
 wire trans_switch_pulse = TRANS_EFFECT_ENABLE ? switch_pulse : 1'b0;
 
 wire        read_finish;
@@ -536,12 +531,12 @@ end
 //   [3] 方块5 locate_done_latched（红=目录解析成功过；绿=从没成功→走了暴力扫描兜底）
 //   [2] 方块6 sd_locate_error（红=解析报错）
 //   [1] 方块7 wav_file_valid（红=目录里认出了 A1.WAV；WAV 走“目录给的首扇区”）
-//   [0] 方块8 wav_sum_ok（临时诊断：红=从卡读回的前 4 扇区字节与 PC 端一致；绿=取数错误）
+//   [0] 方块8 wav_playing（红=WAV 路已被选中在播：此时听到的是卡里的 WAV，不是 ROM 样例）
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
     ? { vid_display_valid, 1'b1, vid_active, 1'b0, vid_st_dbg[3:0] }
-    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_sum_ok };
+    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_playing };
 wire [7:0] key_dbg = dbg_sel;
 
 // 诊断方块要跨时钟域：key_dbg 在 sd_card_clk(100MHz) 域产生，方块画在 video_clk(25MHz) 域。
@@ -762,8 +757,7 @@ wav_audio #(
     .aud_valid           (wav_valid),
     .aud_left            (wav_left_data),
     .aud_right           (wav_right_data),
-    .playing             (wav_playing),
-    .sum_ok              (wav_sum_ok)
+    .playing             (wav_playing)
 );
 
 assign audio_valid      = (wav_playing & wav_file_valid) ? wav_valid      : tone_valid;

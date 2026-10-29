@@ -581,7 +581,7 @@ localparam [3:0] WAV_QUOTA = 4'd1;  // 图像连拿 2 个后必须让 1 个给�
 // 总线看门狗：一次事务（读一个扇区）正常约 1ms，超过 10ms 一定是卡住了
 // （命令没回 / 数据没来）。强行释放总线，避免“一次卡死拖垮全部功能”。
 reg  [23:0] bus_wd;
-localparam [23:0] BUS_WD_MAX          = 24'd2_000_000;   // 10ms @100MHz
+localparam [23:0] BUS_WD_MAX = 24'd1_000_000;   // 10ms @100MHz
 wire bus_wd_fire = (bus_wd >= BUS_WD_MAX);
 
 // 强拆后的“悬停”：旧事务还在控制器里跑，谁都不许再开新事务；悬停超时兜底
