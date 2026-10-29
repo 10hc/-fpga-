@@ -433,7 +433,8 @@ wire switch_pulse = (~video_mode) && (disp_sync2 != disp_sync1);
 // 【重要】转场特效暂时关闭：读地址走转场逻辑时，切图后整屏会变成灰黑乱码
 // （已用仿真确认转场地址序列本身正确，问题在参数/回收时序，需要专门再调）。
 // 关掉后切图就是干净的缓冲区切换。等基础显示彻底稳定后把这里改回 1'b1 再继续调特效。
-localparam TRANS_EFFECT_ENABLE = 1'b0;
+// 转场效果总开关：1 = 短按 KEY2 切图时播放转场（滑入/栅格/淡入淡出依次轮换）
+localparam TRANS_EFFECT_ENABLE = 1'b1;
 wire trans_switch_pulse = TRANS_EFFECT_ENABLE ? switch_pulse : 1'b0;
 
 wire        read_finish;
