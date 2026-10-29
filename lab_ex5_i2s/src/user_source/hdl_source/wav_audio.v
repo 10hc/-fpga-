@@ -330,10 +330,11 @@ module wav_audio #(
             s_r <= 24'd0;
         end else begin
             if (sbuf_we) sbuf[wrp] <= sbuf_din;
-            if (sbuf_re) begin
-                s_l <= {sbuf[rdp][15:0],  8'b0};      // 16bit → 24bit
-                s_r <= {sbuf[rdp][31:16], 8'b0};
-            end
+            // 读口不加条件：rdp 只在 48kHz 节拍上推进，两次节拍之间读出的就是同一个样本，
+            // 因此“每拍都读”与原来的“只在 tick 读”完全等价；而综合器要求读口无条件
+            // 才肯推断成块 RAM（上一版加了 if(sbuf_re) 就被判成分布式 RAM）。
+            s_l <= {sbuf[rdp][15:0],  8'b0};              // 16bit → 24bit
+            s_r <= {sbuf[rdp][31:16], 8'b0};
         end
     end
 
