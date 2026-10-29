@@ -63,6 +63,7 @@ module wav_audio #(
     reg [15:0] cf_ph;
     reg [15:0] sum_acc;
     reg [1:0]  sum_sec;
+    reg [15:0] sec_sum;
     wire [15:0] cf_s16 = cf_ph[15] ? (16'hFFFF - cf_ph) : cf_ph;   // 1kHz 三角波
     wire [11:0] wrp_eff = (SELFTEST == 2'd2) ? wrp_cf : wrp;
     assign sum_ok = (sum16 == SUM_EXPECT);
@@ -126,6 +127,7 @@ module wav_audio #(
             wrp_blk       <= 12'd0;
             to_cnt        <= 25'd0;
             sum_acc       <= 16'd0;
+            sec_sum       <= 16'd0;
             sum_sec       <= 2'd0;
             sum16         <= 16'd0;
             wrp <= 12'd0;
@@ -199,6 +201,7 @@ module wav_audio #(
                         byte_cnt      <= 10'd0;
                         to_cnt        <= 25'd0;
                         draining      <= 1'b0;
+                        sec_sum       <= 16'd0;
                         wrp_blk       <= wrp;              // 记下块首，块不完整就回滚
                         st            <= S_STR_DAT;
                     end
@@ -207,7 +210,7 @@ module wav_audio #(
                 // ---------- 流式：收数据并组装样本 ----------
                 S_STR_DAT: begin
                     if (sec_read_data_valid && !draining) begin
-                        if (sum_sec < 2'd4) sum_acc <= sum_acc + {8'd0, sec_read_data};
+                        sec_sum <= sec_sum + {8'd0, sec_read_data};
                         case (byte_cnt[1:0])
                             2'd0: l16[7:0]  <= sec_read_data;
                             2'd1: l16[15:8] <= sec_read_data;
@@ -244,9 +247,11 @@ module wav_audio #(
                         sec_read <= 1'b0;
                         draining <= 1'b0;                 // 收尾完成，恢复正常接收
                         if (byte_cnt != 10'd512) wrp <= wrp_blk;  // 字节数不对 → 整块丢弃
-                        if (sum_sec < 2'd4) begin
+                        // 校验和只累计“完整收到 512 字节”的扇区：超时半块或重读不会污染结果
+                        if (byte_cnt == 10'd512 && sum_sec < 2'd4) begin
+                            sum_acc <= sum_acc + sec_sum;
                             sum_sec <= sum_sec + 2'd1;
-                            if (sum_sec == 2'd3) sum16 <= sum_acc;
+                            if (sum_sec == 2'd3) sum16 <= sum_acc + sec_sum;
                         end
                         byte_cnt <= 10'd0;
                         if (data_left <= 32'd512) begin
