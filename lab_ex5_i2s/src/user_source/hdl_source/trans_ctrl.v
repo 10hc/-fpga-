@@ -16,6 +16,7 @@ module trans_ctrl #(
     input  wire        rst,            // 高有效
     input  wire        switch_pulse,   // 切图脉冲（disp_buf_idx 变化，1 拍）
     input  wire        frame_done,     // 每帧读完脉冲（read_finish）
+    input  wire        abort,          // 强制中止（视频/图像模式切换时清掉残留转场）
     output reg  [1:0]  trans_effect,
     output reg         trans_en,
     output reg  [9:0]  trans_offset,
@@ -36,6 +37,15 @@ module trans_ctrl #(
             trans_effect <= FX_SLIDE;
             trans_en     <= 1'b0;
             trans_offset <= 10'd0;
+            fade_factor  <= 9'd256;
+            f_phase      <= 2'd0;
+            trans_frames <= 8'd0;
+        end else if (abort) begin
+            // ---- 模式切换（图像↔视频）：立刻终止转场 ----
+            // 视频模式下每帧都换显示缓冲，残留的滑动/淡变会让视频帧按旧图的地址去读，
+            // 表现为视频乱码甚至一直出不了图（深蓝屏）。这里直接收尾成"直通"状态。
+            trans_en     <= 1'b0;
+            trans_offset <= 10'd640;
             fade_factor  <= 9'd256;
             f_phase      <= 2'd0;
             trans_frames <= 8'd0;

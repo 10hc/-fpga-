@@ -101,6 +101,7 @@ wire        wav_valid;
 wire [23:0] wav_left_data;
 wire [23:0] wav_right_data;
 wire        wav_playing;
+wire        wav_sum_ok;          // WAV 前 4 扇区字节校验和比对结果（临时诊断）
 wire        wav_sec_read;
 wire [31:0] wav_sec_read_addr;
 wire [7:0]  wav_sec_read_data;
@@ -196,6 +197,26 @@ always @(posedge video_clk or posedge rst_all) begin
     if (rst_all)      video_mode <= 1'b0;
     else if (k2_long) video_mode <= ~video_mode;
 end
+
+// ---------------------------------------------------------------------------
+// video_mode 同步进 SDRAM/读地址域（ext_mem_clk）。
+//   转场控制、读地址、切图脉冲全部在 ext_mem_clk 域，直接用 video_clk 域的
+//   video_mode 去屏蔽会有跨时钟毛刺窗口 —— 进视频模式那一拍可能漏出一个
+//   switch_pulse，把转场的"旧图/新图基址+偏移"映射留在视频帧上（视频乱码/不出图）。
+// ---------------------------------------------------------------------------
+reg vmode_em0, vmode_em1, vmode_em2;
+always @(posedge ext_mem_clk or posedge rst_all) begin
+    if (rst_all) begin
+        vmode_em0 <= 1'b0;
+        vmode_em1 <= 1'b0;
+        vmode_em2 <= 1'b0;
+    end else begin
+        vmode_em0 <= video_mode;
+        vmode_em1 <= vmode_em0;
+        vmode_em2 <= vmode_em1;
+    end
+end
+wire vmode_changed = vmode_em2 ^ vmode_em1;   // 图像↔视频 模式切换，1 拍脉冲
 
 // 视频模式下屏蔽图像路径的按键（高=未按下），避免它去抢 SD 卡
 
@@ -427,12 +448,13 @@ always @(posedge ext_mem_clk or posedge rst_all) begin
 end
 // 视频模式下播放器每帧都交换显示缓冲区，不能当成"切图"去触发转场，
 // 否则画面会被 SLIDE 效果一帧一帧地横向推来推去（上板现象：图片左右抽动）
-wire switch_pulse = (~video_mode) && (disp_sync2 != disp_sync1);
+wire switch_pulse = (~vmode_em2) && (disp_sync2 != disp_sync1);
 
-// 【重要】转场特效暂时关闭：读地址走转场逻辑时，切图后整屏会变成灰黑乱码
-// （已用仿真确认转场地址序列本身正确，问题在参数/回收时序，需要专门再调）。
-// 关掉后切图就是干净的缓冲区切换。等基础显示彻底稳定后把这里改回 1'b1 再继续调特效。
-localparam TRANS_EFFECT_ENABLE = 1'b0;
+// 【重要】转场特效总开关：1 = 启用（滑动 ↔ 淡入淡出轮换），0 = 关闭（原始直通）。
+//   2026-10-29：与视频模式的互锁已做（见下面的 trans_en_eff / trans_abort），
+//   视频模式下读地址强制直通、进入/退出视频模式立刻终止转场，因此可以打开。
+//   若仍出现"长按进视频 → 深蓝屏"，把这里改回 1'b0 即可回到稳定版行为。
+localparam TRANS_EFFECT_ENABLE = 1'b1;
 wire trans_switch_pulse = TRANS_EFFECT_ENABLE ? switch_pulse : 1'b0;
 
 wire        read_finish;
@@ -448,11 +470,18 @@ trans_ctrl u_trans_ctrl(
     .rst          (rst_all),
     .switch_pulse (trans_switch_pulse),
     .frame_done   (read_finish),
+    .abort        (vmode_changed),
     .trans_effect (trans_effect),
     .trans_en     (trans_en),
     .trans_offset (trans_offset),
     .fade_factor  (fade_factor)
 );
+
+// 转场读地址映射只允许在图像模式生效：视频帧必须走 read_addr_index 直通，
+// 否则残留的 old/new 基址+偏移会把视频帧读到错误的缓冲位置。
+wire trans_en_eff = trans_en & ~vmode_em2;
+// 淡变因子只在图像模式生效（视频不能被淡成黑屏）
+wire [8:0] fade_eff = video_mode ? 9'd256 : fade_factor;
 
 // 转场时读的"旧/新"缓冲基址（disp_sync2 = 当前显示 = 新图）
 wire [20:0] trans_new_base = (disp_sync2 == 2'd0) ? BUF0_ADDR[20:0] : BUF1_ADDR[20:0];
@@ -531,12 +560,12 @@ end
 //   [3] 方块5 locate_done_latched（红=目录解析成功过；绿=从没成功→走了暴力扫描兜底）
 //   [2] 方块6 sd_locate_error（红=解析报错）
 //   [1] 方块7 wav_file_valid（红=目录里认出了 A1.WAV；WAV 走“目录给的首扇区”）
-//   [0] 方块8 wav_playing（红=WAV 路已被选中在播：此时听到的是卡里的 WAV，不是 ROM 样例）
+//   [0] 方块8 wav_sum_ok（临时诊断：红=从卡读回的前 4 扇区字节与 PC 端一致；绿=取数错误）
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
     ? { vid_display_valid, 1'b1, vid_active, 1'b0, vid_st_dbg[3:0] }
-    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_playing };
+    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_sum_ok };
 wire [7:0] key_dbg = dbg_sel;
 
 // 诊断方块要跨时钟域：key_dbg 在 sd_card_clk(100MHz) 域产生，方块画在 video_clk(25MHz) 域。
@@ -560,7 +589,7 @@ video_adjust u_video_adjust(
     .de          (de),
     .sw_bright   (bright_sel),
     .sw_contrast (contrast_sel),
-    .fade        (fade_factor),      // 淡入淡出已折叠进本模块（像素路径仅 1 个乘法器）
+    .fade        (fade_eff),        // 视频模式强制 256（不淡变），图像模式用转场淡变因子
     .rgb_in      (vout_data),
     .rgb_out     (vout_data_adj)
 );
@@ -660,7 +689,7 @@ frame_read_write #(
     .read_data         (video_read_data),
 
     // ===== 花样转场 =====
-    .trans_en          (trans_en),
+    .trans_en          (trans_en_eff),
     .trans_effect      (trans_effect),
     .trans_offset      (trans_offset),
     .trans_old_base    (trans_old_base),
@@ -757,7 +786,8 @@ wav_audio #(
     .aud_valid           (wav_valid),
     .aud_left            (wav_left_data),
     .aud_right           (wav_right_data),
-    .playing             (wav_playing)
+    .playing             (wav_playing),
+    .sum_ok              (wav_sum_ok)
 );
 
 assign audio_valid      = (wav_playing & wav_file_valid) ? wav_valid      : tone_valid;
