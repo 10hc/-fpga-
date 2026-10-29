@@ -19,7 +19,9 @@ module wav_audio #(
     parameter integer VID_CLK_HZ   = 25_000_000,
     parameter integer SAMPLE_RATE  = 48_000,
     parameter [31:0]  SCAN_START   = 32'd0,
-    parameter [31:0]  SCAN_MAX     = 32'd131071
+    parameter [31:0]  SCAN_MAX     = 32'd131071,
+    // 自检音：1 = 不读 SD 数据，在视频域自己产生 1kHz 三角波 + 约 0.7s 通断
+    parameter         SELFTEST     = 1'b1
 )(
     input  wire        sd_clk,
     input  wire        sd_rst,
@@ -288,6 +290,25 @@ module wav_audio #(
         else            vacc <= vacc + SAMPLE_RATE;
     end
 
+    // ==================== 自检音（SELFTEST=1 时生效）====================
+    // 用来区分“取数据坏了”还是“输出通路坏了”：
+    //   自检音 = 间断的干净嘟嘟声 → 输出通路 OK，噪音来自 sbuf 里的数据；
+    //   自检音也沙沙响            → 输出通路（vtick/跨域/aud_valid）本身有问题。
+    reg  [15:0] st_ph;
+    reg  [14:0] st_env;
+    wire [15:0] st_tri = st_ph[15] ? (16'hFFFF - st_ph) : st_ph;
+    wire        st_amp = ~st_env[14];
+
+    always @(posedge vid_clk or posedge vid_rst) begin
+        if (vid_rst) begin
+            st_ph  <= 16'd0;
+            st_env <= 15'd0;
+        end else if (vtick) begin
+            st_ph  <= st_ph + 16'd1365;     // 1365/65536 × 48kHz ≈ 1kHz
+            st_env <= st_env + 15'd1;
+        end
+    end
+
     // ==================== 音频输出（vid 域）====================
     reg [1:0]  tog_sync;
     reg [23:0] h_l, h_r;             // 持稳样本（上一个有效样本）
@@ -309,8 +330,8 @@ module wav_audio #(
             end
             // 精确 48kHz 输出，一个节拍都不少
             if (vtick) begin
-                aud_left  <= h_l;
-                aud_right <= h_r;
+                aud_left  <= SELFTEST ? (st_amp ? {st_tri, 8'b0} : 24'd0) : h_l;
+                aud_right <= SELFTEST ? (st_amp ? {st_tri, 8'b0} : 24'd0) : h_r;
                 aud_valid <= 1'b1;
             end else begin
                 aud_valid <= 1'b0;
