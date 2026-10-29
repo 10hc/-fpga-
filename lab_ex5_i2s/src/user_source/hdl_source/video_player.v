@@ -66,6 +66,9 @@ module video_player #(
                      S_WAIT = 3'd5,
                      S_PACE = 3'd6;
 
+    // S_WAIT 兜底上限：24 bit 满量程 ≈ 167ms @100MHz（正常一帧写入只需 ~6ms）
+    localparam [23:0] WAIT_MAX = 24'hFFFFFF;
+
     // ---------------- 寄存器（全部先声明）----------------
     reg [2:0]  st;
     reg [31:0] addr;
@@ -87,6 +90,7 @@ module video_player #(
     reg        o_div;
 
     reg [31:0] pace_acc;        // 帧率累加器（避免除法器）
+    reg [23:0] wait_cnt;        // S_WAIT 兜底计数（写完成脉冲丢失时不至于僵死）
     reg [2:0]  fin_sync;
     reg        wr_req_set;      // 状态机发出的“请求一次帧写”脉冲
     reg        wr_ready;        // 本帧的写请求已被应答，可以送像素了
@@ -190,6 +194,7 @@ module video_player #(
             disp_buf_idx  <= 2'd0;
             write_buf_idx <= 2'd0;
             display_valid <= 1'b0;
+            wait_cnt      <= 24'd0;
         end else begin
             wr_en       <= 1'b0;
             wr_req_set  <= 1'b0;
@@ -324,6 +329,7 @@ module video_player #(
                                     grp_grp <= grp_grp + 9'd1;
                                     if (grp_grp + 9'd1 >= GROUPS) begin
                                         st <= S_WAIT;          // 整帧发完
+                                        wait_cnt <= 24'd0;     // 进 S_WAIT 时清兜底计数
                                     end else begin
                                         st <= S_GRP;
                                     end
@@ -341,11 +347,21 @@ module video_player #(
             end
 
             // ================= 等帧写完成 =================
+            // 兜底：写完成脉冲若因写通道被显示读通道饿死而迟迟不来，
+            // 最多等 WAIT_MAX 拍就先推进，避免整机僵在第一帧。
             S_WAIT: begin
                 if (fin_pulse) begin
                     disp_buf_idx  <= write_buf_idx;            // 切到新帧
                     display_valid <= 1'b1;
+                    wait_cnt      <= 24'd0;
                     st            <= S_PACE;   // 节拍累加器由上面的块在非 S_PACE 时清零
+                end else if (wait_cnt == WAIT_MAX) begin
+                    disp_buf_idx  <= write_buf_idx;
+                    display_valid <= 1'b1;
+                    wait_cnt      <= 24'd0;
+                    st            <= S_PACE;
+                end else begin
+                    wait_cnt <= wait_cnt + 24'd1;
                 end
             end
 

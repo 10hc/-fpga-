@@ -33,6 +33,10 @@ parameter BUSRT_BITS    = 10;
 parameter FRAME_PIXELS  = 24'd307200;   // 640*480
 parameter BUF0_ADDR     = 24'd0;
 parameter BUF1_ADDR     = FRAME_PIXELS;
+// 视频播放器用 2bit 索引轮转 4 块缓冲；图像模式只用 0/1。
+// 以前 2/3 都接 0：第 3、4 帧会写回正在显示的 BUF0 → 撕裂/花屏，且 60 行组尚未读写分离。
+parameter BUF2_ADDR     = 24'd614400;   // = 2 * 307200
+parameter BUF3_ADDR     = 24'd921600;   // = 3 * 307200
 
 wire Sdr_init_done;
 wire Sdr_init_ref_vld;
@@ -561,38 +565,22 @@ end
 //   [2] 方块6 sd_locate_error（红=解析报错）
 //   [1] 方块7 wav_file_valid（红=目录里认出了 A1.WAV；WAV 走“目录给的首扇区”）
 //   [0] 方块8 wav_sum_ok（临时诊断：红=从卡读回的前 4 扇区字节与 PC 端一致；绿=取数错误）
-// ---- 视频模式诊断：锁存“曾经到过”的里程碑（绿=到过，红=从没到过）----
+// ---- 视频模式诊断：实时状态（不是锁存！绿=0 红=1，随状态机变化，用来定位"现在卡在哪"）----
 // 方块从左到右 = [7]..[0]：
-//   [7] 目录认出了 VIDEO.VID（vid_file_valid）
-//   [6] 播放器启动过（st != S_IDLE）
-//   [5] 从卡里读到过字节（sec_read_data_valid）
-//   [4] 到过 S_GRP（整组整组搬扇区）
-//   [3] 到过 S_WAIT（整帧 60 组都发完了，在等写完成）
-//   [2] 到过 S_PACE（写完成回来了 → 帧真的写进 SDRAM 了）★最关键
-//   [1] display_valid 起来过（有帧提交上屏）
-//   [0] 视频写请求被 frame_fifo_write 应答过（wr_req_ack）
-// 判读：从左往右第一个红格就是卡住的位置。
-reg dv_file, dv_go, dv_data, dv_grp, dv_wait, dv_pace, dv_disp, dv_ack;
-always @(posedge sd_card_clk or posedge rst_all) begin
-    if (rst_all) begin
-        dv_file <= 1'b0; dv_go   <= 1'b0; dv_data <= 1'b0; dv_grp  <= 1'b0;
-        dv_wait <= 1'b0; dv_pace <= 1'b0; dv_disp <= 1'b0; dv_ack  <= 1'b0;
-    end else begin
-        if (vid_file_valid)          dv_file <= 1'b1;
-        if (vid_st_dbg != 4'd0)      dv_go   <= 1'b1;
-        if (vid_sec_read_data_valid) dv_data <= 1'b1;
-        if (vid_st_dbg == 4'd3)      dv_grp  <= 1'b1;   // S_GRP
-        if (vid_st_dbg == 4'd5)      dv_wait <= 1'b1;   // S_WAIT
-        if (vid_st_dbg == 4'd6)      dv_pace <= 1'b1;   // S_PACE（只有 wr_finish 到了才会进）
-        if (vid_display_valid)       dv_disp <= 1'b1;
-        if (video_mode && sd_card_write_req_ack) dv_ack <= 1'b1;
-    end
-end
+//   [7] vid_display_valid（上过屏就一直红）
+//   [6] 播放器忙（st != S_IDLE）
+//   [5:3] 状态码 st[2:0]：0=IDLE 1=SCAN 2=HDR 3=GRP 4=OUT 5=WAIT 6=PACE
+//   [2] sd_card_write_req（正在往 SDRAM 写帧）
+//   [1] vid_sec_read（正在向卡要扇区）
+//   [0] sd_card_write_en（正在吐像素）
+// 判读：卡住时看 [5:3] 的三格红绿，对照上表就知道停在哪个状态。
+
 
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
-    // 视频模式：里程碑锁存图（红=0/没到过，绿=1/到过）
-    ? { dv_file, dv_go, dv_data, dv_grp, dv_wait, dv_pace, dv_disp, dv_ack }
+    // 视频模式：实时状态（绿=0 红=1）
+    ? { vid_display_valid, (vid_st_dbg != 4'd0), vid_st_dbg[2:0],
+        vid_wr_req, vid_sec_read, vid_wr_en }
     : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_sum_ok };
 wire [7:0] key_dbg = dbg_sel;
 
@@ -709,8 +697,8 @@ frame_read_write #(
     .read_finish       (read_finish),
     .read_addr_0       (BUF0_ADDR),
     .read_addr_1       (BUF1_ADDR),
-    .read_addr_2       (24'd0),
-    .read_addr_3       (24'd0),
+    .read_addr_2       (BUF2_ADDR),
+    .read_addr_3       (BUF3_ADDR),
     .read_addr_index   (disp_buf_idx),
     .read_len          (FRAME_PIXELS),
     .read_en           (video_read_en),
@@ -738,8 +726,8 @@ frame_read_write #(
     .write_finish      (frame_write_finish),
     .write_addr_0      (BUF0_ADDR),
     .write_addr_1      (BUF1_ADDR),
-    .write_addr_2      (24'd0),
-    .write_addr_3      (24'd0),
+    .write_addr_2      (BUF2_ADDR),
+    .write_addr_3      (BUF3_ADDR),
     .write_addr_index  (write_buf_idx),
     .write_len         (FRAME_PIXELS),
     .write_en          (sd_card_write_en),
