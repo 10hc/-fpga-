@@ -21,7 +21,8 @@ module wav_audio #(
     parameter [31:0]  SCAN_START   = 32'd0,
     parameter [31:0]  SCAN_MAX     = 32'd131071,
     // 自检音：1 = 不读 SD 数据，在视频域自己产生 1kHz 三角波 + 约 0.7s 通断
-    parameter         SELFTEST     = 1'b1
+    // 0 = 正常播放 WAV；1 = 输出通路自检音；2 = 缓冲自检（写已知正弦，不读 SD）
+    parameter  [1:0]  SELFTEST     = 2'd2
 )(
     input  wire        sd_clk,
     input  wire        sd_rst,
@@ -53,9 +54,14 @@ module wav_audio #(
     // 必须推断成块 RAM：512×32 落 LUT 就要 2754 个 LUT4，4096×32 更不可能。
     reg [31:0] sbuf [0:4095];
     reg [11:0] wrp, rdp;
+    // SELFTEST==2 时用独立写指针（避免和状态机抢同一个 wrp 造成多驱动）
+    reg [11:0] wrp_cf;
+    reg [15:0] cf_ph;
+    wire [15:0] cf_s16 = cf_ph[15] ? (16'hFFFF - cf_ph) : cf_ph;   // 1kHz 三角波
+    wire [11:0] wrp_eff = (SELFTEST == 2'd2) ? wrp_cf : wrp;
 
-    wire [11:0] buf_cnt = wrp - rdp;
-    wire       buf_empty = (wrp == rdp);
+    wire [11:0] buf_cnt = wrp_eff - rdp;
+    wire       buf_empty = (wrp_eff == rdp);
 
     // ==================== 状态机（sd 域）====================
     // 跳转模式下只容忍文件首扇区后 3 个扇区
@@ -353,7 +359,13 @@ module wav_audio #(
             s_l <= 24'd0;
             s_r <= 24'd0;
         end else begin
-            if (sbuf_we) sbuf[wrp] <= sbuf_din;
+            if (SELFTEST == 2'd2) begin
+                // 缓冲自检：用 48kHz 节拍把已知三角波写进缓冲（完全不碰 SD）
+                if (tick && (buf_cnt <= 12'd3967)) begin
+                    sbuf[wrp_cf] <= {cf_s16, cf_s16};
+                    wrp_cf       <= wrp_cf + 12'd1;
+                end
+            end else if (sbuf_we) sbuf[wrp] <= sbuf_din;
             // 读口不加条件：rdp 只在 48kHz 节拍上推进，两次节拍之间读出的就是同一个样本，
             // 因此“每拍都读”与原来的“只在 tick 读”完全等价；而综合器要求读口无条件
             // 才肯推断成块 RAM（上一版加了 if(sbuf_re) 就被判成分布式 RAM）。
