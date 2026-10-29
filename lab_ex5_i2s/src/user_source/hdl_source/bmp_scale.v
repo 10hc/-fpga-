@@ -86,7 +86,7 @@ module bmp_scale (
     wire [12:0] sw = src_w[12:0];
     wire [12:0] sh = src_h[12:0];
 
-    wire [24:0] wx640 = ({12'd0, sw} << 10) - ({12'd0, sw} << 7);   // sw*640
+    wire [24:0] wx640 = ({12'd0, sw} << 9) + ({12'd0, sw} << 7);    // sw*640
     wire [24:0] hy480 = ({12'd0, sh} << 9)  - ({12'd0, sh} << 5);   // sh*480
     wire        width_lim = (wx640 >= hy480);        // 640*src_h <= 480*src_w
 
