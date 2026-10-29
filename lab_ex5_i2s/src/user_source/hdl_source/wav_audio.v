@@ -46,10 +46,13 @@ module wav_audio #(
 );
 
     // ==================== 样本环形缓冲（sd 域，512×32 推断 BRAM）====================
-    reg [31:0] sbuf [0:511];
-    reg [8:0] wrp, rdp;
+    // [容错] 4096 样本 = 85.3ms 缓冲（原 512 样本 = 10.7ms）。
+    // 真卡若偶发“整块读延迟 >10ms”，老缓冲会被抽干 → 持续沙沙声；85ms 足以吸收两三次抖动。
+    // 必须推断成块 RAM：512×32 落 LUT 就要 2754 个 LUT4，4096×32 更不可能。
+    reg [31:0] sbuf [0:4095];
+    reg [11:0] wrp, rdp;
 
-    wire [8:0] buf_cnt = wrp - rdp;
+    wire [11:0] buf_cnt = wrp - rdp;
     wire       buf_empty = (wrp == rdp);
 
     // ==================== 状态机（sd 域）====================
@@ -73,7 +76,7 @@ module wav_audio #(
     reg         draining; // 超时后丢弃本块剩余字节、等 end 收尾（避免整块重复+半帧错位）
     // 【2026-10-28 修·只收“完整块”】每个扇区开始前记下写指针，块不完整（被强拆/超时/字节数≠512）
     //   就回滚到块首，绝不把半块样本留在缓冲里 —— 半块是“从第一个音符起就沙沙响”的直接成因。
-    reg [8:0]   wrp_blk;
+    reg [11:0]  wrp_blk;
     reg [31:0]  data_left;           // 剩余数据字节（循环用）
     reg [31:0]  data_start;
 
@@ -89,7 +92,7 @@ module wav_audio #(
     // 512 样本 = 10.7ms。**【不要再加大】** 这种小数组 TD 会做成分布式 RAM（吃 LUT/切片），
     // 4096 样本会把 mslice 顶到 6626 > 4900 直接超限；音频不断音靠的是
     // “配额仲裁 + 只在扇区边界让路”，不是靠缓冲深度。
-    wire buf_room = (buf_cnt <= 9'd383);
+    wire buf_room = (buf_cnt <= 12'd3967);   // 不允许写满，避免满/空二义
 
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
@@ -105,9 +108,9 @@ module wav_audio #(
             data_left     <= 32'd0;
             data_start    <= 32'd0;
             draining      <= 1'b0;
-            wrp_blk       <= 9'd0;
+            wrp_blk       <= 12'd0;
             to_cnt        <= 25'd0;
-            wrp <= 9'd0;
+            wrp <= 12'd0;
             // 注意：rdp 只在下面"48kHz 节拍 + 握手"那个 always 块里驱动
             //      （包括它的复位），否则综合器会报 multiple drivers
         end else begin
@@ -192,7 +195,7 @@ module wav_audio #(
                             2'd2: r_low     <= sec_read_data;
                             2'd3: begin
                                 // 数据写入在模块末尾的专用 always 块里（为了被推断成块 RAM）
-                                wrp <= wrp + 9'd1;
+                                wrp <= wrp + 12'd1;
                             end
                         endcase
                         byte_cnt <= byte_cnt + 10'd1;
@@ -264,10 +267,10 @@ module wav_audio #(
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
             s_toggle <= 1'b0;
-            rdp      <= 9'd0;                         // rdp 唯一驱动点
+            rdp      <= 12'd0;                         // rdp 唯一驱动点
         end else if (tick) begin
             if (!buf_empty) begin
-                rdp <= rdp + 9'd1;
+                rdp <= rdp + 12'd1;
             end
             // 缓冲空（例如正在给图片加载让路）：保持上一个样本，
             // 节拍照走 —— 给 HDMI 的音频流一旦断供，接收端失锁就是持续噪音。
