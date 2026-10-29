@@ -24,7 +24,7 @@ module wav_audio #(
     // 0 = 正常播放 WAV；1 = 输出通路自检音；2 = 缓冲自检（写已知正弦，不读 SD）
     parameter  [1:0]  SELFTEST     = 2'd0,
     // 期望校验和：PC 端对卡上文件 data_start 起前 4 扇区(2048B) 求和取低 16 位
-    parameter  [15:0] SUM_EXPECT   = 16'h0000
+    parameter  [15:0] SUM_EXPECT   = 16'hF5E2
 )(
     input  wire        sd_clk,
     input  wire        sd_rst,

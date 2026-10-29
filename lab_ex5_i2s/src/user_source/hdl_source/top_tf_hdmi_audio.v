@@ -101,6 +101,7 @@ wire        wav_valid;
 wire [23:0] wav_left_data;
 wire [23:0] wav_right_data;
 wire        wav_playing;
+wire        wav_sum_ok;          // WAV 前 4 扇区字节校验和比对结果（临时诊断）
 wire        wav_sec_read;
 wire [31:0] wav_sec_read_addr;
 wire [7:0]  wav_sec_read_data;
@@ -531,12 +532,12 @@ end
 //   [3] 方块5 locate_done_latched（红=目录解析成功过；绿=从没成功→走了暴力扫描兜底）
 //   [2] 方块6 sd_locate_error（红=解析报错）
 //   [1] 方块7 wav_file_valid（红=目录里认出了 A1.WAV；WAV 走“目录给的首扇区”）
-//   [0] 方块8 wav_playing（红=WAV 路已被选中在播：此时听到的是卡里的 WAV，不是 ROM 样例）
+//   [0] 方块8 wav_sum_ok（临时诊断：红=从卡读回的前 4 扇区字节与 PC 端一致；绿=取数错误）
 reg [7:0] dbg_sel;
 always @(*) dbg_sel = video_mode
     // 视频模式用“红绿红绿红绿”交替图案，绝不会和图像模式混淆
     ? { vid_display_valid, 1'b1, vid_active, 1'b0, vid_st_dbg[3:0] }
-    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_playing };
+    : { img_sd_init_done, img_dbg[7], img_load_busy, img_wd_seen, img_locate_done_latched, sd_locate_error, wav_file_valid, wav_sum_ok };
 wire [7:0] key_dbg = dbg_sel;
 
 // 诊断方块要跨时钟域：key_dbg 在 sd_card_clk(100MHz) 域产生，方块画在 video_clk(25MHz) 域。
@@ -757,7 +758,8 @@ wav_audio #(
     .aud_valid           (wav_valid),
     .aud_left            (wav_left_data),
     .aud_right           (wav_right_data),
-    .playing             (wav_playing)
+    .playing             (wav_playing),
+    .sum_ok              (wav_sum_ok)
 );
 
 assign audio_valid      = (wav_playing & wav_file_valid) ? wav_valid      : tone_valid;

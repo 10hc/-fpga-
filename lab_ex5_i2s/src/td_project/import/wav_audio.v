@@ -22,7 +22,9 @@ module wav_audio #(
     parameter [31:0]  SCAN_MAX     = 32'd131071,
     // 自检音：1 = 不读 SD 数据，在视频域自己产生 1kHz 三角波 + 约 0.7s 通断
     // 0 = 正常播放 WAV；1 = 输出通路自检音；2 = 缓冲自检（写已知正弦，不读 SD）
-    parameter  [1:0]  SELFTEST     = 2'd2
+    parameter  [1:0]  SELFTEST     = 2'd0,
+    // 期望校验和：PC 端对卡上文件 data_start 起前 4 扇区(2048B) 求和取低 16 位
+    parameter  [15:0] SUM_EXPECT   = 16'hF5E2
 )(
     input  wire        sd_clk,
     input  wire        sd_rst,
@@ -45,7 +47,9 @@ module wav_audio #(
     output reg         aud_valid,          // 每个样本 1 拍
     output reg  [23:0] aud_left,
     output reg  [23:0] aud_right,
-    output wire        playing
+    output wire        playing,
+    output reg  [15:0] sum16,          // 前 4 个流式扇区的字节和（冻结）
+    output wire        sum_ok
 );
 
     // ==================== 样本环形缓冲（sd 域，512×32 推断 BRAM）====================
@@ -57,8 +61,11 @@ module wav_audio #(
     // SELFTEST==2 时用独立写指针（避免和状态机抢同一个 wrp 造成多驱动）
     reg [11:0] wrp_cf;
     reg [15:0] cf_ph;
+    reg [15:0] sum_acc;
+    reg [1:0]  sum_sec;
     wire [15:0] cf_s16 = cf_ph[15] ? (16'hFFFF - cf_ph) : cf_ph;   // 1kHz 三角波
     wire [11:0] wrp_eff = (SELFTEST == 2'd2) ? wrp_cf : wrp;
+    assign sum_ok = (sum16 == SUM_EXPECT);
 
     wire [11:0] buf_cnt = wrp_eff - rdp;
     wire       buf_empty = (wrp_eff == rdp);
@@ -118,6 +125,9 @@ module wav_audio #(
             draining      <= 1'b0;
             wrp_blk       <= 12'd0;
             to_cnt        <= 25'd0;
+            sum_acc       <= 16'd0;
+            sum_sec       <= 2'd0;
+            sum16         <= 16'd0;
             wrp <= 12'd0;
             // 注意：rdp 只在下面"48kHz 节拍 + 握手"那个 always 块里驱动
             //      （包括它的复位），否则综合器会报 multiple drivers
@@ -197,6 +207,7 @@ module wav_audio #(
                 // ---------- 流式：收数据并组装样本 ----------
                 S_STR_DAT: begin
                     if (sec_read_data_valid && !draining) begin
+                        if (sum_sec < 2'd4) sum_acc <= sum_acc + {8'd0, sec_read_data};
                         case (byte_cnt[1:0])
                             2'd0: l16[7:0]  <= sec_read_data;
                             2'd1: l16[15:8] <= sec_read_data;
@@ -233,6 +244,10 @@ module wav_audio #(
                         sec_read <= 1'b0;
                         draining <= 1'b0;                 // 收尾完成，恢复正常接收
                         if (byte_cnt != 10'd512) wrp <= wrp_blk;  // 字节数不对 → 整块丢弃
+                        if (sum_sec < 2'd4) begin
+                            sum_sec <= sum_sec + 2'd1;
+                            if (sum_sec == 2'd3) sum16 <= sum_acc;
+                        end
                         byte_cnt <= 10'd0;
                         if (data_left <= 32'd512) begin
                             addr      <= data_start;      // 循环回开头
