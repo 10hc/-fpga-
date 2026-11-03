@@ -69,9 +69,13 @@ module frame_read_write
 	input[1:0]                       write_addr_index,           // select valid base address from write_addr_0 write_addr_1 write_addr_2 write_addr_3
 	input[ADDR_BITS - 1:0]           write_len,                  // data write module write request data length
 	input                            write_en,                   // data write module write request for one data
+    input                            write_abort,
+    output                           write_idle,
+    output                           write_ready,
 	input[WRITE_DATA_BITS - 1:0]     write_data,                // write data
 
 	// ===== 转场特效（新增）=====
+	input                            trans_abort,
 	input                            trans_en,
 	input[1:0]                       trans_effect,
 	input[9:0]                       trans_offset,
@@ -83,8 +87,10 @@ module frame_read_write
 	output        dbg_rd_req2,
 	output        dbg_rd_init
 );
-wire[BURST_BITS - 1:0]                           wrusedw;                    // write used words
-wire[BURST_BITS - 1:0]                           rdusedw;                    // read used words
+// The generated 512-word FIFOs expose 9-bit counts, independently of the
+// burst-counter parameter. Explicitly extend them at the 10-bit controller ports.
+wire[8:0]                                      wrusedw;
+wire[8:0]                                      rdusedw;
 
 wire 								 App_rd_busy;
 wire								 App_wr_busy;
@@ -94,7 +100,22 @@ wire                                 write_fifo_aclr;            // fifo Asynchr
 
 wire O_wr_busy;
 wire O_rd_busy;
-wire wr_fifo_full;                    // 写 FIFO 满（rdusedw 只有 9 位，512 会绕成 0，必须用满标志判断）
+wire wr_fifo_full;                    // Write-domain full: producer backpressure only.
+wire [8:0] write_usedw;
+// Generated IP reserves one entry (FULL_NUM=511), so its 9-bit read-domain
+// count is unambiguous. Never use the SD-domain full flag in mem arbitration.
+wire write_buf_full_mem = (rdusedw == 9'd511);
+// The FIFO clear is generated in mem_clk. Assert inhibition immediately,
+// but release it only after two write_clk edges; never feed its asynchronous
+// deassertion directly into the producers' pixel/state enables.
+wire write_reset = rst || write_fifo_aclr;
+reg [1:0] write_reset_sync;
+always @(posedge write_clk or posedge write_reset) begin
+    if (write_reset) write_reset_sync <= 2'b11;
+    else write_reset_sync <= {write_reset_sync[0],1'b0};
+end
+// Reserve room for synchronizer latency and registered producers.
+assign write_ready = !write_reset_sync[1] && !wr_fifo_full && write_usedw < 9'd480;
 
 assign App_wr_busy = O_wr_busy;//下个时钟写指令拉高
 assign App_rd_busy = O_rd_busy;//读指令还没有过去十个时钟;因为写指令优先，不需要在意下个时钟是否是读指令
@@ -109,9 +130,12 @@ wfifo_32_32_512 write_buf
 	.we                      	(write_en                 ),          // Write Request
 	.re                      	(App_wr_en        		  ),          // Read Request
 	.di                       	(write_data               ),          // Input Data
-	.empty_flag                 (                         ),          // Read side Empty flag
+	.empty_flag                 (                         ),
 	.full_flag                  (wr_fifo_full             ),          // Write side Full flag
-	.wrusedw                	(              	  		  ),          // Read Used Words
+    .valid                      (),
+    .afull                      (),
+    .aempty                     (),
+	.wrusedw                    (write_usedw              ),
 	.rdusedw                	(rdusedw                  ),          // Write Used Words
 	.dout                       (App_wr_din		          )
 );
@@ -131,6 +155,8 @@ frame_fifo_write_m0
 (  
 	.rst                        (rst                      ),
 	.mem_clk                    (mem_clk                  ),
+    .write_abort                (write_abort              ),
+    .write_idle                 (write_idle               ),
     .Sdr_init_done				(Sdr_init_done),
 	.Sdr_init_ref_vld			(Sdr_init_ref_vld),
     .Sdr_busy					(Sdr_busy),
@@ -149,8 +175,8 @@ frame_fifo_write_m0
 	.write_addr_index           (write_addr_index         ),    
 	.write_len                  (write_len                ),
 	.fifo_aclr                  (write_fifo_aclr          ),
-	.rdusedw                 	(rdusedw                  ),
-	.fifo_full                  (wr_fifo_full             )
+	.rdusedw                 	({1'b0, rdusedw}          ),
+	.fifo_full                  (write_buf_full_mem       )
 );
 
 //instantiate an asynchronous FIFO 
@@ -163,7 +189,10 @@ rfifo_32_32_512 read_buf
 	.re                     	(read_en                    ),          // Read Request
 	.di                      	(Sdr_rd_dout                ),          // Input Data
 	.empty_flag					(                           ),          // Read side Empty flag
-	.full_flag					(                           ),          // Write side Full flag
+	.full_flag					(                           ),
+    .valid                      (),
+    .afull                      (),
+    .aempty                     (),
 	.wrusedw                	(wrusedw         	  	  		 ),          // Read Used Words
 	.rdusedw                	(                  			 ),          // Write Used Words
 	.dout						(read_data                  )
@@ -175,7 +204,8 @@ frame_fifo_read
 	.MEM_DATA_BITS              (MEM_DATA_BITS            ),
 	.ADDR_BITS                  (ADDR_BITS                ),
 	.BURST_BITS                 (BURST_BITS               ),
-	.BURST_SIZE                 (BURST_SIZE               )
+	.BURST_SIZE                 (BURST_SIZE               ),
+    .FRAME_WIDTH                (FRAME_WIDTH              )
 )
 frame_fifo_read_m0
 (
@@ -200,8 +230,9 @@ frame_fifo_read_m0
 	.read_addr_index            (read_addr_index          ),    
 	.read_len                   (read_len                 ),
 	.fifo_aclr                  (read_fifo_aclr           ),
-	.wrusedw                	(wrusedw                  ),
+	.wrusedw                	({1'b0, wrusedw}          ),
 	// ===== 转场特效 =====
+	.trans_abort                    (trans_abort              ),
 	.trans_en					(trans_en                 ),
 	.trans_effect				(trans_effect             ),
 	.trans_offset				(trans_offset             ),

@@ -1,3 +1,13 @@
+# 同步音视频：优先使用新工具
+
+本次 VID2 位流请配合 `make_av_video.py` 使用，将视频与配套音轨封装成单个 `.VID`。默认推荐 12 fps，音频为 48 kHz / PCM16 / 立体声。完整用法见 [make_av_video.md](make_av_video.md)，系统说明见 [音视频打包与同步播放](../../docs/音视频打包与同步播放.md)。
+
+现成验收素材位于 `../../docs/demo_assets/av_sync/VIDEO.VID`。它包含三秒闪光与提示音，不需要另配 WAV；图片模式原有 WAV 可保留。新 VID2 不要使用旧 `flip_vid.py` 再次翻转。
+
+以下是旧工具说明；更换同步视频无需运行 `sync_to_sd.py`，该旧脚本会删除卡上文件。
+
+---
+
 # FPGA TF卡 BMP 图片批量转换工具
 
 这个脚本（`convert_images_to_bmp.py`）专为本 FPGA 工程设计，主要用于将用户手中的各种常见图片格式快速转换为满足本系统 TF 卡读取要求的标准格式：**640x480 分辨率、24 位、无压缩的 BMP 图片**。

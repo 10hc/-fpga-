@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""检查 TF 卡（或 U 盘）里的文件是否符合 FPGA 工程要求。
+r"""检查 TF 卡（或 U 盘）里的文件是否符合 FPGA 工程要求。
 
 检查项：
   1. 图片：必须是 640x480、24 位、无压缩的 BMP（文件大小 = 54 + 640*480*3 = 921654）
   2. 音频：必须是 48kHz / 16bit / 2 声道的 PCM WAV
-  3. 视频：.VID 头部 'VID1' + 宽 320 高 240，且每帧 320*240*2 字节
+  3. 视频：VID1 保持原检查；VID2 调用 make_av_video 检查头部、长度和音频补零
   4. 和本地已翻转/补齐的 VIDEO.VID 对比（判断卡上是不是新版）
   5. 尝试读卷引导扇区，算出数据区起始扇区（FPGA 扫描范围要覆盖到）
 
@@ -66,6 +66,19 @@ def check_wav(path):
 def check_vid(path, local=None):
     with open(path, "rb") as f:
         head = f.read(512)
+    if head[0:4] == b"VID2":
+        # Load the sibling tool without changing sys.path or requiring FFmpeg.
+        import importlib.util
+        try:
+            module_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "..", "convert", "make_av_video.py")
+            spec = importlib.util.spec_from_file_location("_vid2_inspector", module_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            info = module.inspect_file(path)
+        except (OSError, ValueError, ImportError) as error:
+            return f"VID2 检查失败：{error}", None
+        return "OK（VID2 音视频交织）", tuple(info[k] for k in ("width", "height", "fps", "frames"))
     if head[0:4] != b"VID1":
         return "不是 .VID（缺少 VID1 标记）", None
     w, h, fps, frames = struct.unpack_from("<HHHI", head, 4)

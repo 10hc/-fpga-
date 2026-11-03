@@ -1,95 +1,91 @@
-
-# ============================================================
-# merged_top_tf_hdmi_audio.sdc
-# 用于：TF 图片轮播 + HDMI(视频+音频) 整合工程
-#
-# 合并原则：
-# 1) 保留 top.sdc 里的系统主时钟与 derive_clocks
-# 2) 把 timing(2).sdc 里的 pixel/serial 时钟改成整合工程实际名字
-# 3) 增加 hdmi_5x_clk / audio_mclk 的命名
-# 4) 不再对内部 net 直接 create_clock，避免和 derive_clocks 重复
-# ============================================================
-
-# ------------------------------------------------------------
-# 1. 板级输入主时钟
-#    你的原 top.sdc 里 clk=50MHz，所以这里仍然用 20ns
-# ------------------------------------------------------------
+# TD 6.2.168116 / EG4S20BG256. CDC repair, 2026-10-30.
+# Keep PLL-derived frequencies/phases; do not recreate internal clocks.
 create_clock -name clk -period 20 -waveform {0 10} [get_ports {clk}]
-
-# ------------------------------------------------------------
-# 2. 自动推导 PLL 输出时钟
-# ------------------------------------------------------------
 derive_clocks
-
-# ------------------------------------------------------------
-# 3. 给关键 PLL 输出命名
-#    下面这些路径是按你当前工程实例名写的：
-#      sys_pll      -> sys_pll_m0
-#      video_pll    -> video_pll_m0
-#      音频 PLL     -> u_audio_pll
-#
-#    如果综合后实例路径略有不同，就按 Timing Analyzer 里的实际 pin 路径改。
-# ------------------------------------------------------------
 rename_clock -name {sd_card_clk} -source [get_ports {clk}] -master_clock {clk} [get_pins {sys_pll_m0/pll_inst.clkc[0]}]
 rename_clock -name {ext_mem_clk} -source [get_ports {clk}] -master_clock {clk} [get_pins {sys_pll_m0/pll_inst.clkc[1]}]
 rename_clock -name {video_clk}   -source [get_ports {clk}] -master_clock {clk} [get_pins {video_pll_m0/pll_inst.clkc[0]}]
 rename_clock -name {hdmi_5x_clk} -source [get_ports {clk}] -master_clock {clk} [get_pins {video_pll_m0/pll_inst.clkc[1]}]
 rename_clock -name {audio_mclk}  -source [get_ports {clk}] -master_clock {clk} [get_pins {u_audio_pll/pll_inst.clkc[2]}]
 
-# ------------------------------------------------------------
-# 4. 从原 timing(2).sdc 迁移过来的 HDMI 像素/串行时钟约束
-#
-#    原文件是：
-#      create_clock -name pixel_clk  ... [get_nets {S_pixel_clk}]
-#      create_clock -name serial_clk ... [get_nets {S_serial_clk}]
-#      set_clock_groups -exclusive ...
-#
-#    在整合工程里，这两个时钟已经由 video_pll 产生，并通过 derive_clocks 建出来了，
-#    所以这里只保留“组关系”，不再重复 create_clock。
-#
-#    这里沿用原作者的写法，把 video_clk 和 hdmi_5x_clk 设成 exclusive。
-#    如果后面 Timing Analyzer 明确显示两者之间需要做同步时序分析，再把这一条去掉。
-# ------------------------------------------------------------
-set_clock_groups -exclusive \
-    -group [get_clocks {video_clk}] \
-    -group [get_clocks {hdmi_5x_clk}]
+# No clock-group cuts: video pixel/5x operate concurrently; SD/memory are
+# outputs of the same system PLL. Keep their real inter-clock timing, and
+# keep ext_mem_clk <-> sys_pll_m0/pll_inst.clkc[2] (125 MHz, 180 degrees).
+# No cross-domain-wide false_path, multicycle, phase or IO-delay guesses.
 
-# ------------------------------------------------------------
-# 5. 音频 I2S 发生器/接收器跨域
-#
-#    audio_mclk 域里生成 I2S，video_clk 域里做三拍同步采样。
-#    这类路径不是普通同步时序路径，直接切掉更合理。
-# ------------------------------------------------------------
-set_clock_groups -asynchronous \
-    -group [get_clocks {audio_mclk}] \
-    -group [get_clocks {video_clk} hdmi_5x_clk sd_card_clk ext_mem_clk]
+# I2S_receiver.v:42-53: ONLY the three first sampling flops, with the
+# corresponding registered transmitter output as source. Subsequent stages
+# and all other audio paths remain timed. No overlap with FIFO Gray regs.
+set_false_path -from [get_regs {u_hdmi_audio_tone_i2s_64fs/O_i2s_BCLK}] -to [get_regs {u_I2S_receiver/S_i2s_bclk_1d}]
+set_false_path -from [get_regs {u_hdmi_audio_tone_i2s_64fs/O_i2s_LRCK}] -to [get_regs {u_I2S_receiver/S_i2s_lrck_1d}]
+set_false_path -from [get_regs {u_hdmi_audio_tone_i2s_64fs/O_i2s_DOUT}] -to [get_regs {u_I2S_receiver/S_i2s_dout_1d}]
 
-# ------------------------------------------------------------
-# 6. 【已启用】sd_card / ext_mem / video / hdmi_5x 四个域互视为异步
-#
-#    为什么现在开：
-#    综合/布局报告里 SWNS -7.776ns 的最差路径是
-#       起点 u_video_player/ack_dly_reg[2]（sd_card_clk 域）
-#       终点 u_sobel_edge/g_reg[6].fci     （video_clk 域）
-#    这两个寄存器之间**没有任何真实逻辑通路**，工具是穿过异步 FIFO / 跨域
-#    结构“猜”出来的一条伪路径（预算 10ns、数据 15.686ns）。
-#    它把 SWNS 拖到 -7.776，TD 的时序优化器因此不断报“abort timing optimization”。
-#
-#    前提（已逐一核对）：这四个域之间的真实跨域全部经过
-#      a) 例程的异步 FIFO（frame_write_fifo / frame_read_fifo）
-#      b) 顶层 2~3 级同步器（disp_sync0/1/2、key_dbg_v1/v2、wr_finish 同步等）
-#    所以声明异步是正确做法，不是掩盖问题。
-#
-#    启用后预期：该 -7.776 消失，SWNS 回落到 SDRAM IP 自身那条
-#    U3/sdram.dq -> bpad 的 -6.699ns（原例程同样存在，上板已验证可用）。
-# ------------------------------------------------------------
-set_clock_groups -asynchronous \
-    -group [get_clocks {sd_card_clk}] \
-    -group [get_clocks {ext_mem_clk}] \
-    -group [get_clocks {video_clk}] \
-    -group [get_clocks {hdmi_5x_clk}]
+# Single-bit controls: ONLY source domain -> explicitly audited FIRST stage.
+# The first stage feeds only the next synchronizer stage unless noted below.
+# mode_pixel_sync[1], request_sync[1], wrfin_tgl_sync[1:2], fin_sync[1:2]
+# and all functional consumers retain their destination-clock timing.
+set_false_path -from [get_regs {u_media_mode_ctrl/active_mode}] -to [get_regs {mode_pixel_sync[0]}]
+set_false_path -from [get_regs {video_mode_requested}] -to [get_regs {u_media_mode_ctrl/request_sync[0]}]
+set_false_path -from [get_regs {frame_write_toggle_mem}] -to [get_regs {sd_card_bmp_m0/wrfin_tgl_sync[0] u_video_player/fin_sync[0]}]
 
-# ------------------------------------------------------------
-# 7. 其余 Input/Output delay 先保持空白
-#    你当前两个原始 sdc 也都没有写这部分。
-# ------------------------------------------------------------
+# Registered read request is held until acknowledgement. Only d0 is cut;
+# the unsynchronized return acknowledgement is NOT cut at functional logic.
+set_false_path -from [get_regs {video_timing_data_m0/read_req}] -to [get_regs {frame_read_write_m0/frame_fifo_read_m0/read_req_d0}]
+# Write request/abort are control levels, held by the SD-domain producer.
+# Restrict to these first sampling flops; no address/length/data bus cuts.
+set_false_path -from [get_clocks -of [get_pins {sys_pll_m0/pll_inst.clkc[0]}]] -to [get_regs {frame_read_write_m0/frame_fifo_write_m0/write_req_d0 frame_read_write_m0/frame_fifo_write_m0/abort_sync[0]}]
+
+# Memory idle status is a single-domain decode sampled through 2/3 flops.
+# Top and manager first-stage logical aliases may merge to the same flop.
+set_false_path -from [get_clocks -of [get_pins {sys_pll_m0/pll_inst.clkc[1]}]] -to [get_regs {write_idle_sync[0] sd_card_bmp_m0/writer_idle_sync[0]}]
+# inhibit = active_mode OR pending, both SD-domain controls; only its first
+# sampler is exempt, not the arbitrary combinational CDCs elsewhere.
+set_false_path -from [get_clocks -of [get_pins {sys_pll_m0/pll_inst.clkc[0]}]] -to [get_regs {u_image_transition_ctrl/inhibit_sync[0]}]
+
+# Transition ownership req/ack added by the parallel RTL repair. These exact
+# names must be checked on the NEW elaborated/routed netlist (absent in 19:12 DB).
+set_false_path -from [get_regs {sd_card_bmp_m0/transition_req_toggle}] -to [get_regs {u_image_transition_ctrl/release_req_sync[0]}]
+set_false_path -from [get_regs {u_image_transition_ctrl/transition_done_toggle}] -to [get_regs {sd_card_bmp_m0/transition_done_sync[0]}]
+set_false_path -from [get_clocks -of [get_pins {sys_pll_m0/pll_inst.clkc[1]}]] -to [get_regs {sd_card_bmp_m0/transition_busy_sync[0]}]
+
+# Descriptor is a bundled payload, NOT a false path. Bound its registered
+# SD producer -> memory-domain first sample physically to min(10,8)-0.3ns.
+# The producer holds the published descriptor while awaiting release ack.
+# d0->d1->d2 and stable/commit logic are timed normally in ext_mem_clk.
+set_max_delay -from [get_regs {sd_card_bmp_m0/display_valid sd_card_bmp_m0/disp_buf_idx[*]}] -to [get_regs {u_image_transition_ctrl/image_d0[*]}] -datapath_only 7.700
+
+# WAV has NO cross-domain binary buffer pointers: wrp AND rdp use sd_clk.
+# Only s_toggle and held s_l/s_r cross to video. Exempt only the incoming
+# control sample; h_l/h_r bundled payload and all paths OUT of tog_sync[0]
+# stay timed. The repaired RTL uses three stages and consumes [2] ^ [1],
+# so the first sample is used only by the next synchronizer stage.
+set_false_path -from [get_regs {u_wav_audio/s_toggle}] -to [get_regs {u_wav_audio/tog_sync[0]}]
+
+# Gray pointer max delay is provided by the existing IP SDCs, loaded AFTER
+# this user SDC by TD settings.cfg with read_sdc -ip:
+#   rfifo_32_32_512 : ip/afifo_32_16_256.tcl
+#   wfifo_32_32_512 : ip/afifo_16_32_256.tcl
+# Each uses primary_addr_gray_reg[*] -> sync_r1[*], datapath_only,
+# min(clkw period, clkr period)-0.3ns = 7.7ns for the current configuration.
+# TD SWUG200 3.11.3: datapath_only also suppresses hold on THESE paths.
+# Do NOT add false_path (including setup-only) over those Gray paths;
+# do NOT replace this with set_clock_groups or reorder to try to override it.
+# Other CDC / bundled buses remain analyzed pending protocol/endpoint review.
+# Unspecified board IO delays remain a separate, open interface requirement.
+
+# Frame writer ACK is a registered level held until producer request drops.
+# Only the newly added first samplers are exempt; ack_sync[1] and consumers
+# keep normal SD-clock timing. FIFO flags use their native domain in RTL.
+set_false_path -from [get_regs {frame_read_write_m0/frame_fifo_write_m0/write_req_ack}] -to [get_regs {u_video_player/ack_sync[0] sd_card_bmp_m0/bmp_read_m0/ack_sync[0]}]
+
+# fifo_aclr asynchronously asserts the TWO reset-release flops only. Both
+# stages stay asserted through clear; write_ready uses stage 2 after two local
+# edges. Exempt incoming reset assertion/recovery, retaining normal timing on
+# the local shift chain, FIFO count/full and all producer enable paths.
+set_false_path -from [get_regs {frame_read_write_m0/frame_fifo_write_m0/fifo_aclr}] -to [get_regs {frame_read_write_m0/write_reset_sync[*]}]
+
+# Slowly changing diagnostic state / display visibility has its own pixel
+# sampler. This bound applies ONLY to the first sampling stage; later stages
+# and the pixel color selector keep normal video-clock timing. This bus is
+# never used as a memory descriptor or as a frame ownership acknowledgement.
+set_max_delay -from [get_clocks {sd_card_clk}] -to [get_regs {u_display_status/status_d0[*]}] -datapath_only 9.700

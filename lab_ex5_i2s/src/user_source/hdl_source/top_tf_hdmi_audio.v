@@ -196,36 +196,44 @@ key_short_long #(
     .long_pulse  (k2_long)
 );
 
-reg video_mode;
+reg video_mode_requested;
+wire video_mode;
+wire mode_switch_pending;
+wire storage_idle, wav_active, vid_wr_abort;
+wire vid_active;
+wire frame_write_idle;
+reg [2:0] write_idle_sync;
+reg [1:0] mode_pixel_sync;
+reg mode_previous;
+wire image_invalidate = mode_previous && !video_mode;
 always @(posedge video_clk or posedge rst_all) begin
-    if (rst_all)      video_mode <= 1'b0;
-    else if (k2_long) video_mode <= ~video_mode;
-end
-
-// ---------------------------------------------------------------------------
-// video_mode 同步进 SDRAM/读地址域（ext_mem_clk）。
-//   转场控制、读地址、切图脉冲全部在 ext_mem_clk 域，直接用 video_clk 域的
-//   video_mode 去屏蔽会有跨时钟毛刺窗口 —— 进视频模式那一拍可能漏出一个
-//   switch_pulse，把转场的"旧图/新图基址+偏移"映射留在视频帧上（视频乱码/不出图）。
-// ---------------------------------------------------------------------------
-reg vmode_em0, vmode_em1, vmode_em2;
-always @(posedge ext_mem_clk or posedge rst_all) begin
     if (rst_all) begin
-        vmode_em0 <= 1'b0;
-        vmode_em1 <= 1'b0;
-        vmode_em2 <= 1'b0;
+        video_mode_requested <= 1'b0;
+        mode_pixel_sync <= 2'b00;
     end else begin
-        vmode_em0 <= video_mode;
-        vmode_em1 <= vmode_em0;
-        vmode_em2 <= vmode_em1;
+        if (k2_long) video_mode_requested <= ~video_mode_requested;
+        mode_pixel_sync <= {mode_pixel_sync[0], video_mode};
     end
 end
-wire vmode_changed = vmode_em2 ^ vmode_em1;   // 图像↔视频 模式切换，1 拍脉冲
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all) begin
+        write_idle_sync <= 3'b000;
+        mode_previous <= 1'b0;
+    end else begin
+        write_idle_sync <= {write_idle_sync[1:0], frame_write_idle};
+        mode_previous <= video_mode;
+    end
+end
+media_mode_ctrl u_media_mode_ctrl (
+    .clk(sd_card_clk), .rst(rst_all), .requested(video_mode_requested),
+    .quiescent(storage_idle && !vid_active && !wav_active && write_idle_sync[2]),
+    .active_mode(video_mode), .pending(mode_switch_pending)
+);
 
 // 视频模式下屏蔽图像路径的按键（高=未按下），避免它去抢 SD 卡
 
-wire key_next_img = video_mode ? 1'b1 : key1_g;
-wire key_auto_img = video_mode ? 1'b1 : key2_g;
+wire key_next_img = (video_mode || mode_switch_pending) ? 1'b1 : key1_g;
+wire key_auto_img = (video_mode || mode_switch_pending) ? 1'b1 : key2_g;
 
 // ---- 图像路径（sd_card_bmp）的原始信号 ----
 wire        img_display_valid;
@@ -233,6 +241,7 @@ wire [1:0]  img_write_buf_idx;
 wire [1:0]  img_disp_buf_idx;
 wire        img_write_req;
 wire        img_write_en;
+wire        img_write_abort, frame_write_ready;
 wire [31:0] img_write_data;
 wire [7:0]  img_dbg;          // 图像加载/提交状态（给屏幕方块）
 wire        img_load_busy;    // 正在加载一张图（音频此时让出 SD 总线）
@@ -271,15 +280,13 @@ wire [31:0] vid_wr_data;
 wire        vid_display_valid;
 wire [1:0]  vid_disp_buf_idx;
 wire [1:0]  vid_write_buf_idx;
-wire        vid_active;
 wire [3:0]  vid_st_dbg;
-
 video_player #(
     .CLK_FREQ_HZ (100_000_000)
 ) u_video_player (
     .clk                 (sd_card_clk),
     .rst                 (rst_all),
-    .enable              (video_mode),
+    .enable              (video_mode && !mode_switch_pending),
     .file_valid          (vid_file_valid),
     .file_sector         (vid_file_sector),
     .sec_read            (vid_sec_read),
@@ -289,9 +296,11 @@ video_player #(
     .sec_read_end        (vid_sec_read_end),
     .wr_req              (vid_wr_req),
     .wr_req_ack          (sd_card_write_req_ack),
+    .write_ready         (frame_write_ready),
     .wr_en               (vid_wr_en),
     .wr_data             (vid_wr_data),
     .wr_finish           (frame_write_toggle_mem),
+    .wr_abort            (vid_wr_abort),
     .display_valid       (vid_display_valid),
     .disp_buf_idx        (vid_disp_buf_idx),
     .write_buf_idx       (vid_write_buf_idx),
@@ -301,7 +310,7 @@ video_player #(
 
 // ---- 帧写通道与显示控制：视频模式接管，否则用图像路径 ----
 assign display_valid      = video_mode ? vid_display_valid : img_display_valid;
-assign disp_buf_idx       = video_mode ? vid_disp_buf_idx  : img_disp_buf_idx;
+assign disp_buf_idx       = video_mode ? vid_disp_buf_idx : img_disp_buf_idx;
 assign write_buf_idx      = video_mode ? vid_write_buf_idx : img_write_buf_idx;
 assign sd_card_write_req  = video_mode ? vid_wr_req        : img_write_req;
 assign sd_card_write_en   = video_mode ? vid_wr_en         : img_write_en;
@@ -325,6 +334,7 @@ assign wav_sec_read_end        = sec_from_bmp_end        & ~video_mode;
 
 // ===================== TF 多图扫描与缓存（双缓冲） =====================
 wire img_locate_done_latched;   // 目录解析成功过（锁存位，给诊断方块⑤）
+wire img_transition_req, img_transition_busy, img_transition_done;
 sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
     .SCAN_START_SECTOR (32'd0),
@@ -337,7 +347,9 @@ sd_card_bmp #(
     .rst               (rst_all),
     .key_next          (key_next_img),
     .key_auto          (key_auto_img),
-    .suspend           (video_mode),
+    .suspend           (video_mode || mode_switch_pending),
+    .invalidate        (image_invalidate),
+    .storage_idle      (storage_idle),
     .single_buf        (1'b0),
     .state_code        (state_code),
     .dbg               (img_dbg),
@@ -359,11 +371,17 @@ sd_card_bmp #(
     .wav_file_sector   (wav_file_sector),
 
     .write_finish_toggle(frame_write_toggle_mem),
+    .transition_req_toggle(img_transition_req),
+    .transition_busy   (img_transition_busy),
+    .transition_done_toggle(img_transition_done),
     .write_buf_idx     (img_write_buf_idx),
     .disp_buf_idx      (img_disp_buf_idx),
 
     .write_req         (img_write_req),
     .write_req_ack     (sd_card_write_req_ack),
+    .write_ready       (frame_write_ready),
+    .write_idle        (frame_write_idle),
+    .write_abort       (img_write_abort),
     .write_en          (img_write_en),
     .write_data        (img_write_data),
     .SD_nCS            (sd_ncs),
@@ -405,7 +423,8 @@ video_timing_data video_timing_data_m0(
     .read_req_ack      (video_read_req_ack),
     .hs                (hs_0),
     .vs                (vs_0),
-    .de                (de_0)
+    .de                (de_0),
+    .frame_start       ()
 );
 
 video_delay video_delay_m0(
@@ -426,70 +445,48 @@ video_delay video_delay_m0(
 // 未出图时用背景色表示状态（诊断用）
 // 深蓝=视频模式但还没有画面   红=SD未初始化  绿=空闲(未找到图)  蓝=扫描/读BMP头
 // 紫=等待写入  青=加载数据中  灰=其它
+wire pixel_display_valid;
+wire [3:0] pixel_state_code;
+display_status_cdc u_display_status (
+    .clk(video_clk), .rst(rst_all),
+    .source_valid(display_valid), .source_state(state_code),
+    .display_valid(pixel_display_valid), .state_code(pixel_state_code)
+);
 wire [23:0] diag_color =
-    video_mode            ? 24'h000080 :
-    (state_code == 4'd0) ? 24'hFF0000 :
-    (state_code == 4'd1) ? 24'h00FF00 :
-    (state_code == 4'd2) ? 24'h0080FF :
-    (state_code == 4'd3) ? 24'h8000FF :
-    (state_code == 4'd4) ? 24'h00FFFF :
+    mode_pixel_sync[1]    ? 24'h000080 :
+    (pixel_state_code == 4'd0) ? 24'hFF0000 :
+    (pixel_state_code == 4'd1) ? 24'h00FF00 :
+    (pixel_state_code == 4'd2) ? 24'h0080FF :
+    (pixel_state_code == 4'd3) ? 24'h8000FF :
+    (pixel_state_code == 4'd4) ? 24'h00FFFF :
                            24'h404040;
-assign vout_data = display_valid ? vout_data_raw : diag_color;
+assign vout_data = pixel_display_valid ? vout_data_raw : diag_color;
 
-// ===================== 花样转场：滑动 / 栅格 / 淡入淡出 =====================
-// disp_buf_idx 同步到 mem_clk 域，用于检测"切图脉冲"
-reg [1:0] disp_sync0, disp_sync1, disp_sync2;
-always @(posedge ext_mem_clk or posedge rst_all) begin
-    if (rst_all) begin
-        disp_sync0 <= 2'd0;
-        disp_sync1 <= 2'd0;
-        disp_sync2 <= 2'd0;
-    end else begin
-        disp_sync0 <= disp_buf_idx;
-        disp_sync1 <= disp_sync0;
-        disp_sync2 <= disp_sync1;
-    end
-end
-// 视频模式下播放器每帧都交换显示缓冲区，不能当成"切图"去触发转场，
-// 否则画面会被 SLIDE 效果一帧一帧地横向推来推去（上板现象：图片左右抽动）
-wire switch_pulse = (~vmode_em2) && (disp_sync2 != disp_sync1);
-
-// 【重要】转场特效总开关：1 = 启用（滑动 ↔ 淡入淡出轮换），0 = 关闭（原始直通）。
-//   2026-10-29：与视频模式的互锁已做（见下面的 trans_en_eff / trans_abort），
-//   视频模式下读地址强制直通、进入/退出视频模式立刻终止转场，因此可以打开。
-//   若仍出现"长按进视频 → 深蓝屏"，把这里改回 1'b0 即可回到稳定版行为。
+// Image transitions observe image commits only, never the video buffer rotation.
 localparam TRANS_EFFECT_ENABLE = 1'b1;
-wire trans_switch_pulse = TRANS_EFFECT_ENABLE ? switch_pulse : 1'b0;
-
 wire        read_finish;
-wire        trans_en;
+wire        trans_en_eff;
+wire        trans_abort;
 wire [1:0]  trans_effect;
 wire [9:0]  trans_offset;
 wire [8:0]  fade_factor;
-
-// 每次切图自动轮换效果：滑动 → 栅格 → 淡入淡出 → 滑动 …
-// 以"每帧读完"为节拍推进，帧内参数恒定 → 画面平滑
-trans_ctrl u_trans_ctrl(
-    .clk          (ext_mem_clk),
-    .rst          (rst_all),
-    .switch_pulse (trans_switch_pulse),
-    .frame_done   (read_finish),
-    .abort        (vmode_changed),
-    .trans_effect (trans_effect),
-    .trans_en     (trans_en),
-    .trans_offset (trans_offset),
-    .fade_factor  (fade_factor)
+wire [1:0] trans_old_idx, trans_new_idx;
+image_transition_ctrl #(.EFFECT_ENABLE(TRANS_EFFECT_ENABLE)) u_image_transition_ctrl (
+    .clk(ext_mem_clk), .rst(rst_all),
+    .inhibit(video_mode || mode_switch_pending),
+    .image_valid(img_display_valid), .image_index(img_disp_buf_idx),
+    .frame_done(read_finish), .transition_abort(trans_abort),
+    .trans_en(trans_en_eff), .trans_effect(trans_effect),
+    .trans_offset(trans_offset), .fade_factor(fade_factor),
+    .old_index(trans_old_idx), .new_index(trans_new_idx),
+    .transition_req_toggle(img_transition_req),
+    .transition_busy(img_transition_busy),
+    .transition_done_toggle(img_transition_done)
 );
-
-// 转场读地址映射只允许在图像模式生效：视频帧必须走 read_addr_index 直通，
-// 否则残留的 old/new 基址+偏移会把视频帧读到错误的缓冲位置。
-wire trans_en_eff = trans_en & ~vmode_em2;
 // 淡变因子只在图像模式生效（视频不能被淡成黑屏）
-wire [8:0] fade_eff = video_mode ? 9'd256 : fade_factor;
-
-// 转场时读的"旧/新"缓冲基址（disp_sync2 = 当前显示 = 新图）
-wire [20:0] trans_new_base = (disp_sync2 == 2'd0) ? BUF0_ADDR[20:0] : BUF1_ADDR[20:0];
-wire [20:0] trans_old_base = (disp_sync2 == 2'd0) ? BUF1_ADDR[20:0] : BUF0_ADDR[20:0];
+wire [8:0] fade_eff = mode_pixel_sync[1] ? 9'd256 : fade_factor;
+wire [20:0] trans_new_base = trans_new_idx[0] ? BUF1_ADDR[20:0] : BUF0_ADDR[20:0];
+wire [20:0] trans_old_base = trans_old_idx[0] ? BUF1_ADDR[20:0] : BUF0_ADDR[20:0];
 
 // ===================== 扩展①/④：亮度对比度 + OSD 文字 =====================
 // KEY3：短按 → 亮度循环切换；长按（>1s）→ 对比度循环切换
@@ -509,8 +506,8 @@ reg [1:0] bright_sel;
 reg [1:0] contrast_sel;
 always @(posedge video_clk or posedge rst_all) begin
     if (rst_all) begin
-        bright_sel   <= 2'd3;      // 3 = 默认档（正常）
-        contrast_sel <= 2'd3;
+        bright_sel   <= 2'd1;      // 1 = 默认档（正常），0..3 按效果递增
+        contrast_sel <= 2'd1;
     end else begin
         if (k3_short) bright_sel   <= bright_sel   + 2'd1;
         if (k3_long)  contrast_sel <= contrast_sel + 2'd1;
@@ -569,7 +566,7 @@ end
 // 方块从左到右 = [7]..[0]：
 //   [7] vid_display_valid（上过屏就一直红）
 //   [6] 播放器忙（st != S_IDLE）
-//   [5:3] 状态码 st[2:0]：0=IDLE 1=SCAN 2=HDR 3=GRP 4=OUT 5=WAIT 6=PACE
+//   [5:3] 状态码 st[2:0]：0=IDLE 1=SCAN 2=HDR 3=GRP 4=OUT 5=WAIT 6=PACE 7=HALT(错误停止)
 //   [2] sd_card_write_req（正在往 SDRAM 写帧）
 //   [1] vid_sec_read（正在向卡要扇区）
 //   [0] sd_card_write_en（正在吐像素）
@@ -705,6 +702,7 @@ frame_read_write #(
     .read_data         (video_read_data),
 
     // ===== 花样转场 =====
+    .trans_abort       (trans_abort),
     .trans_en          (trans_en_eff),
     .trans_effect      (trans_effect),
     .trans_offset      (trans_offset),
@@ -721,6 +719,9 @@ frame_read_write #(
     .App_wr_dm         (App_wr_dm),
 
     .write_clk         (sd_card_clk),
+    .write_abort       (video_mode ? vid_wr_abort : img_write_abort),
+    .write_idle        (frame_write_idle),
+    .write_ready       (frame_write_ready),
     .write_req         (sd_card_write_req),
     .write_req_ack     (sd_card_write_req_ack),
     .write_finish      (frame_write_finish),
@@ -791,7 +792,8 @@ wav_audio #(
     // 所以每 1 秒就有一次图片加载；以前用 ~img_load_busy 停音频，一停一启
     // 正好与“音乐一秒后变噪音”对上。仲裁器本身已按 2:1 配额保证图像优先，
     // 音频只需 192KB/s（占 4MB/s 的 5%），不需要停。
-    .enable              (display_valid & ~video_mode),
+    .enable              (img_display_valid && !video_mode && !mode_switch_pending),
+    .active              (wav_active),
     .file_valid          (wav_file_valid),
     .file_sector         (wav_file_sector),
     .sec_read            (wav_sec_read),
@@ -806,9 +808,14 @@ wav_audio #(
     .sum_ok              (wav_sum_ok)
 );
 
-assign audio_valid      = (wav_playing & wav_file_valid) ? wav_valid      : tone_valid;
-assign audio_left_data  = (wav_playing & wav_file_valid) ? wav_left_data  : tone_left_data;
-assign audio_right_data = (wav_playing & wav_file_valid) ? wav_right_data : tone_right_data;
+// VID1 has no embedded audio. Keep the existing audio cadence while
+// sending silence in video mode; picture-mode WAV/fallback audio is retained.
+assign audio_valid      = mode_pixel_sync[1] ? tone_valid :
+                          ((wav_playing & wav_file_valid) ? wav_valid : tone_valid);
+assign audio_left_data  = mode_pixel_sync[1] ? 24'd0 :
+                          ((wav_playing & wav_file_valid) ? wav_left_data : tone_left_data);
+assign audio_right_data = mode_pixel_sync[1] ? 24'd0 :
+                          ((wav_playing & wav_file_valid) ? wav_right_data : tone_right_data);
 
 audio_arc_calculate #(
     .ACR_N         (6144)
@@ -907,4 +914,157 @@ hdmi_phy_wrapper #(
     .O_tmds_clk_p       (HDMI_CLK_P)
 );
 
+endmodule
+
+// Image buffers use indices 0/1. Keep their history separate from video mode.
+// The image descriptor is held by the producer; require a stable synchronized
+// value before observing a commit. This does not replace the display CDC protocol.
+// Slowly changing display/status levels only. This sampler does not publish
+// memory addresses or release frame ownership. Two agreeing synchronized
+// samples prevent an intermediate diagnostic code from being adopted.
+module display_status_cdc(
+    input wire clk, rst, source_valid,
+    input wire [3:0] source_state,
+    output wire display_valid,
+    output wire [3:0] state_code
+);
+    reg [4:0] status_d0, status_d1, status_d2, status_held;
+    assign display_valid = status_held[4];
+    assign state_code = status_held[3:0];
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            status_d0 <= 0; status_d1 <= 0; status_d2 <= 0; status_held <= 0;
+        end else begin
+            status_d0 <= {source_valid,source_state};
+            status_d1 <= status_d0;
+            status_d2 <= status_d1;
+            if (status_d1 == status_d2) status_held <= status_d2;
+        end
+    end
+endmodule
+
+module image_transition_ctrl #(
+    parameter EFFECT_ENABLE = 1'b1
+)(
+    input wire clk, rst, inhibit, image_valid,
+    input wire [1:0] image_index,
+    input wire frame_done,
+    output wire transition_abort, trans_en,
+    output wire [1:0] trans_effect,
+    output wire [9:0] trans_offset,
+    output wire [8:0] fade_factor,
+    output reg [1:0] old_index, new_index,
+    input wire transition_req_toggle,
+    output wire transition_busy,
+    output reg transition_done_toggle
+);
+    reg [2:0] inhibit_sync;
+    reg [2:0] image_d0, image_d1, image_d2;
+    reg have_image, switch_event;
+    wire image_stable = image_d1 == image_d2;
+    wire image_available = image_stable && image_d2[2] && !image_d2[1];
+    wire raw_en;
+    wire [8:0] raw_fade;
+    reg [1:0] release_req_sync;
+    reg release_req_seen, release_pending;
+    reg [2:0] release_settle;
+    // Request and descriptor cross together and remain held until this ack.
+    // Extra settling cycles cover the descriptor's longer synchronizer and
+    // the registered switch_event -> effect startup path, even without FX.
+    assign transition_busy = release_pending ||
+                             (release_req_sync[1] != transition_done_toggle);
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            release_req_sync <= 2'b00;
+            release_req_seen <= 1'b0;
+            release_pending <= 1'b0;
+            release_settle <= 3'd0;
+            transition_done_toggle <= 1'b0;
+        end else begin
+            release_req_sync <= {release_req_sync[0], transition_req_toggle};
+            if (release_req_sync[1] != release_req_seen) begin
+                release_req_seen <= release_req_sync[1];
+                release_pending <= 1'b1;
+                release_settle <= 3'd3;
+            end else if (release_pending) begin
+                if (release_settle != 0)
+                    release_settle <= release_settle - 3'd1;
+                // read_finish/frame_done comes directly from this clock
+                // domain's reader S_END, after its last memory burst. The
+                // reader cannot simultaneously be in S_ACK latching an old
+                // mapping. Test pre-edge effect-idle: when trans_en falls on
+                // a frame_done, that SAME boundary must not release the old
+                // buffer. Wait for the subsequent completed read frame.
+                else if (frame_done && !switch_event &&
+                         (transition_abort ||
+                          (image_available && have_image &&
+                           new_index == image_d2[1:0] &&
+                           (!EFFECT_ENABLE || (!raw_en && raw_fade == 9'd256))))) begin
+                    transition_done_toggle <= release_req_seen;
+                    release_pending <= 1'b0;
+                end
+            end
+        end
+    end
+    assign transition_abort = inhibit_sync[2] ||
+                              (image_stable && (!image_d2[2] || image_d2[1]));
+    assign trans_en = EFFECT_ENABLE && !transition_abort && raw_en;
+    assign fade_factor = (EFFECT_ENABLE && !transition_abort) ? raw_fade : 9'd256;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            inhibit_sync <= 3'b000;
+            image_d0 <= 3'd0; image_d1 <= 3'd0; image_d2 <= 3'd0;
+            have_image <= 1'b0; switch_event <= 1'b0;
+            old_index <= 2'd0; new_index <= 2'd0;
+        end else begin
+            inhibit_sync <= {inhibit_sync[1:0], inhibit};
+            image_d0 <= {image_valid, image_index};
+            image_d1 <= image_d0; image_d2 <= image_d1;
+            switch_event <= 1'b0;
+            if (inhibit_sync[2] || (image_stable && !image_available))
+                have_image <= 1'b0;
+            else if (image_available) begin
+                if (!have_image) begin
+                    new_index <= image_d2[1:0];
+                    old_index <= image_d2[1:0];
+                    have_image <= 1'b1;
+                end else if (new_index != image_d2[1:0]) begin
+                    old_index <= new_index;
+                    new_index <= image_d2[1:0];
+                    switch_event <= 1'b1;
+                end
+            end
+        end
+    end
+    trans_ctrl u_effect (
+        .clk(clk), .rst(rst), .switch_pulse(switch_event && EFFECT_ENABLE),
+        .frame_done(frame_done), .abort(transition_abort),
+        .trans_en(raw_en), .trans_effect(trans_effect),
+        .trans_offset(trans_offset), .fade_factor(raw_fade)
+    );
+endmodule
+
+// Transfer channel ownership only after all current clients have drained.
+module media_mode_ctrl(
+    input wire clk, rst, requested, quiescent,
+    output reg active_mode,
+    output wire pending
+);
+    reg [1:0] request_sync;
+    reg [1:0] idle_count;
+    assign pending = request_sync[1] != active_mode;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            request_sync <= 2'b00;
+            active_mode <= 1'b0;
+            idle_count <= 2'd0;
+        end else begin
+            request_sync <= {request_sync[0], requested};
+            if (!pending || !quiescent) idle_count <= 2'd0;
+            else if (idle_count == 2'd3) begin
+                active_mode <= request_sync[1];
+                idle_count <= 2'd0;
+            end else idle_count <= idle_count + 2'd1;
+        end
+    end
 endmodule

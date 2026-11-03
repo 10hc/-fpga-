@@ -29,6 +29,8 @@ module frame_fifo_write
 	input                            wr_burst_finish,            // from external memory controller,burst write finish
 	*/
 	input                            write_req,                  // data write module write request,keep '1' until read_req_ack = '1'
+    input                            write_abort,
+    output                           write_idle,
 	output reg                       write_req_ack,              // data write module write request response
 	output                           write_finish,               // data write module write request finish
 	input[ADDR_BITS - 1:0]           write_addr_0,               // data write module write request base address 0, used when write_addr_index = 0
@@ -39,7 +41,7 @@ module frame_fifo_write
 	input[ADDR_BITS - 1:0]           write_len,                  // data write module write request data length
 	output reg                       fifo_aclr,                  // to fifo asynchronous clear
 	input[9:0]                      rdusedw,                    // from fifo read used words
-	input                            fifo_full                   // fifo full flag（rdusedw 是 9 位，满 512 会显示 0，必须靠这个）
+	input                            fifo_full                   // mem_clk-domain availability only
 );
 localparam ONE                       = 256'd1;                   //256 bit '1'   you can use ONE[n-1:0] for n bit '1'
 localparam ZERO                      = 256'd0;                   //256 bit '0'
@@ -61,12 +63,15 @@ localparam S_END                     = 5;                        //a frame of da
 
 
 reg                                 write_req_d0;                //asynchronous write request, synchronize to 'mem_clk' clock domain,first beat
+reg [1:0] abort_sync;
+reg abort_pending;
 reg                                 write_req_d1;                //the second
 reg                                 write_req_d2;                //third,Why do you need 3 ? Here's the design habit
 reg[ADDR_BITS - 1:0]                write_len_d0;                //asynchronous write_len(write data length), synchronize to 'mem_clk' clock domain first
 reg[ADDR_BITS - 1:0]                write_len_d1;                //second
 reg[ADDR_BITS - 1:0]                write_len_latch;             //lock write data length
 reg[ADDR_BITS - 1:0]                write_cnt;                   //write data counter
+reg[ADDR_BITS - 1:0]                remaining_words;
 reg[1:0]                            write_addr_index_d0;
 reg[1:0]                            write_addr_index_d1;
 reg[3:0]                            state;                       //state machine
@@ -80,15 +85,28 @@ reg App_wr_en_r;
 reg App_wr_en_d0;
 
 wire into_burst;
-// 注意 rdusedw 只有 9 位：FIFO 满 512 字时它绕回 0，会把“满”误判成“空”，
-// 导致写通道永远进不了 burst、write_finish 永不到来（视频卡在第一帧的真凶）。
-// 所以这里必须或上 fifo_full。
-assign into_burst = (((write_len_latch <= (rdusedw + write_cnt))||rdusedw > BURST_SIZE||fifo_full) && ~App_rd_busy);//当rd在突发时不会进入burst
+assign write_idle = (state == S_IDLE) && !write_req_d2;
+always @(posedge mem_clk or posedge rst) begin
+    if (rst) begin
+        abort_sync <= 2'b00;
+        abort_pending <= 1'b0;
+    end else begin
+        abort_sync <= {abort_sync[0], write_abort};
+        if (abort_sync[1]) abort_pending <= 1'b1;
+        else if (state == S_IDLE) abort_pending <= 1'b0;
+    end
+end
+// Compare against a registered remainder rather than count + write_cnt on
+// the arbitration path. Exactly one burst is sufficient, including tails.
+// The supplied IP has usable capacity 511; its count never represents 512.
+assign into_burst = ((remaining_words <= rdusedw || rdusedw >= BURST_SIZE || fifo_full) && ~App_rd_busy);
 
 assign App_wr_addr = {App_wr_addr_r[ADDR_BITS - 1:0]};
 //assign O_wr_busy = (state != S_IDLE || (S_IDLE && write_req_d2));
 assign O_wr_busy = (state == S_WRITE_BURST || (state == S_CHECK_FIFO && into_burst));//在突发，或者将要突发，则显示busy
-assign wr_burst_finish = (burst_cnt >= BURST_SIZE);
+// A final partial burst must terminate after its actual number of words.
+// Waiting for BURST_SIZE after disabling App_wr_en would deadlock forever.
+assign wr_burst_finish = (burst_cnt >= BURST_SIZE || burst_cnt >= remaining_words);
 assign write_finish = (state == S_END) ? 1'b1 : 1'b0;            //write finish at state 'S_END'
 assign App_wr_en = App_wr_en_d0;
 
@@ -167,7 +185,8 @@ begin
 		else
 			App_wr_addr_r <= App_wr_addr_r;
 		//
-		if(App_wr_en_r && burst_cnt + App_wr_en < BURST_SIZE && (burst_cnt + write_cnt + App_wr_en < write_len_latch))begin
+		if(App_wr_en_r && burst_cnt + App_wr_en < BURST_SIZE &&
+           burst_cnt + App_wr_en < remaining_words)begin
             App_wr_en_d0 <= 1'b1;
         end
 		else
@@ -187,13 +206,21 @@ begin
 		App_wr_en_r <= 1'b0;
 		
 		write_cnt <= ZERO[ADDR_BITS - 1:0];
+		remaining_words <= ZERO[ADDR_BITS - 1:0];
 		fifo_aclr <= 1'b0;
 		write_req_ack <= 1'b0;
 		//wr_burst_len <= ZERO[BURST_BITS - 1:0];
 		
 		
 	end
-	else 
+	else if ((abort_pending || abort_sync[1]) && state != S_WRITE_BURST) begin
+        state <= S_IDLE;
+        fifo_aclr <= 1'b1;
+        App_wr_en_r <= 1'b0;
+        write_req_ack <= 1'b0;
+        write_cnt <= ZERO[ADDR_BITS - 1:0];
+        remaining_words <= ZERO[ADDR_BITS - 1:0];
+    end else
 		case(state)
 			//idle state,waiting for write write_req_d2 == '1' goto the 'S_ACK'
 			S_IDLE:
@@ -233,6 +260,7 @@ begin
 					*/
 					//latch data length
 					write_len_latch <= write_len_d1;                    
+					remaining_words <= write_len_d1;
 				end
 				//write data counter reset, write_cnt <= 0;
 				write_cnt <= ZERO[ADDR_BITS - 1:0];
@@ -263,6 +291,8 @@ begin
 					state <= S_WRITE_BURST_END;
 					//write counter + burst length
 					write_cnt <= write_cnt + BURST_SIZE[ADDR_BITS - 1:0];
+					remaining_words <= remaining_words > BURST_SIZE ?
+                        remaining_words - BURST_SIZE : ZERO[ADDR_BITS - 1:0];
 					//the next burst write address is generated
 					//wr_burst_addr <= wr_burst_addr + BURST_SIZE[ADDR_BITS - 1:0];
 				end     

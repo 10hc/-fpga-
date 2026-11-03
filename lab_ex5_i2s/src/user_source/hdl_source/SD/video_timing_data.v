@@ -11,7 +11,8 @@ module video_timing_data
 	//input[DATA_WIDTH - 1:0]     read_data,          // Read data
 	output                      hs,                 // horizontal synchronization
 	output                      vs,                 // vertical synchronization
-	output                      de                  // video valid
+	output                      de,                 // video valid
+    output                      frame_start         // same edge that requests a new display frame
 	//output[DATA_WIDTH - 1:0]    vout_data           // video data
 );
 wire                   video_hs;
@@ -30,6 +31,7 @@ reg                    video_de_d1;
 assign hs = video_hs_d1;
 assign vs = video_vs_d1;
 assign de = video_de_d1;
+assign frame_start = video_vs_d0 & ~video_vs;
 //assign vout_data = vout_data_r;
 always@(posedge video_clk or posedge rst)
 begin
@@ -65,7 +67,7 @@ always@(posedge video_clk or posedge rst)
 begin
 	if(rst == 1'b1)
 		read_req <= 1'b0;
-	else if(video_vs_d0 & ~video_vs) //vertical synchronization edge (the rising or falling edges are OK)
+	else if(frame_start) //vertical synchronization edge (the rising or falling edges are OK)
 		read_req <= 1'b1;
 	else if(read_req_ack)
 		read_req <= 1'b0;

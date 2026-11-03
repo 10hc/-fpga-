@@ -13,8 +13,8 @@
 //      数值来源：顶层 bright_sel / contrast_sel / cfg_sobel（SWKEY1 边缘检测）
 //
 // ● 内部 1 拍流水线：顶层需把送 AXIS 的 de/vs 延迟 1 拍对齐
-// ● 汉字字库是 192x16 的 ROM（12 个字模 x 16 行），已加 syn_ramstyle=block_ram
-//   让 TD 推断成 BRAM，不占 LUT
+// ● 汉字字库是 192x16 ROM，使用分布式 ROM 并保留原同步读流水。
+//   为打包视频 PCM 缓冲释放一个 BRAM，字模和显示时序不变。
 // ============================================================
 module osd_overlay #(
     parameter integer CHAR_W      = 8,     // 字符宽
@@ -154,7 +154,7 @@ module osd_overlay #(
     wire        panel_row_ok = (prow != 2'd2);
 
     // ---------- 汉字字模 ROM：192 x 16（12 字模 x 16 行）----------
-    (* syn_ramstyle = "block_ram" *) reg [15:0] cjk_rom [0:191];
+    (* rom_style = "dram" *) reg [15:0] cjk_rom [0:191];
     initial begin
         cjk_rom[  0] = 16'h0000;
         cjk_rom[  1] = 16'h0000;

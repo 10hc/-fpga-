@@ -11,6 +11,8 @@ module sd_card_bmp #(
     input                       rst,
     input                       key_next,
     input                       key_auto,
+    input                       invalidate,
+    output                      storage_idle,
     input                       suspend,       // 视频模式：停掉图片自动播放/加载，别和视频抢带宽
     input                       single_buf,    // 诊断：单缓冲测试（新图写进当前正在显示的缓冲，用来分辨“写坏了”还是“切缓冲坏了”）
     output [3:0]                state_code,
@@ -38,6 +40,9 @@ module sd_card_bmp #(
 
     output                      write_req,
     input                       write_req_ack,
+    input                       write_ready,
+    input                       write_idle,
+    output                      write_abort,
     output                      write_en,
     output [31:0]               write_data,
     output                      SD_nCS,
@@ -50,7 +55,16 @@ module sd_card_bmp #(
     input  [31:0]               wav_sec_read_addr,
     output [7:0]                wav_sec_read_data,
     output                      wav_sec_read_data_valid,
-    output                      wav_sec_read_end
+    output                      wav_sec_read_end,
+
+    // Bundled commit/release handshake with the memory clock domain. Every
+    // published image (including the first) toggles req. The receiver must
+    // return that value only after adopting the descriptor and draining all
+    // old-frame reads, including abort/no-effect commits. Do not use a pulse
+    // or simply wire trans_en to busy (fade-in still belongs to the effect).
+    output reg                  transition_req_toggle,
+    input                       transition_busy,
+    input                       transition_done_toggle
 );
 // ===================== FAT32 目录解析（上电一次）=====================
 reg         locate_kicked;
@@ -88,6 +102,10 @@ wire [23:0]      bmp_data;
 wire             sd_init_done;
 assign           sd_init_done_o = sd_init_done;
 wire             bmp_ready;
+wire bmp_load_done, bmp_load_error;
+reg [3:0] abort_hold;
+reg [1:0] writer_idle_sync;
+assign write_abort = abort_hold != 0;
 wire             scan_done;
 wire             scan_found_valid;
 wire [31:0]      scan_found_sector;
@@ -99,7 +117,9 @@ wire [2:0]       scan_found_total;
 // ---------------------------------------------------------------------------
 localparam [29:0] LOCATE_TO_CYCLES = 30'd800_000_000;   // 8s：从“解析开始”起算（见下方计数器）
 reg  [29:0] locate_to_cnt;
-wire        locate_to = (locate_to_cnt >= LOCATE_TO_CYCLES);
+// A registered, sticky timeout both terminates failed directory discovery
+// and keeps its 30-bit comparator out of the SD payload fanout path.
+reg         locate_to;
 wire        locate_ok = locate_done_r | locate_to;
 // fat_sel 现在是【锁存的授权】（见下面仲裁器）：一旦把总线交给目录解析，
 // 就锁死到这次事务结束，绝不中途改地址/掐数据。
@@ -109,9 +129,17 @@ always @(posedge clk or posedge rst) begin
     // 【2026-10-26 修正】超时从"解析真正开始(locate_kicked)"起算。
     // 旧写法从上电就开始计时：SD 卡初始化要 1~2 秒，加上解析本身，
     // 3 秒很容易在解析还没跑完时就到点 → locate_to=1 → 快路径被放弃 → 退回 40 秒暴力扫描。
-    if (rst) locate_to_cnt <= 30'd0;
-    else if (!locate_kicked || locate_done_r || locate_to) locate_to_cnt <= 30'd0;
-    else locate_to_cnt <= locate_to_cnt + 30'd1;
+    if (rst) begin
+        locate_to_cnt <= 30'd0;
+        locate_to <= 1'b0;
+    end else if (!locate_kicked || locate_done_r || locate_to) begin
+        locate_to_cnt <= 30'd0;
+    end else if (locate_to_cnt >= LOCATE_TO_CYCLES - 30'd1) begin
+        locate_to_cnt <= 30'd0;
+        locate_to <= 1'b1;
+    end else begin
+        locate_to_cnt <= locate_to_cnt + 30'd1;
+    end
 end
 
 reg              scan_start_pulse;
@@ -130,9 +158,42 @@ reg [31:0]       img_sector1;
 reg [31:0]       img_sector2;
 reg [31:0]       img_sector3;
 reg              next_req_pending;
+reg              auto_req_pending;
 reg              load_busy;
+reg              load_discard;
 
-// bmp_ready 先表示“源文件读取/送 FIFO 完成”；真正切显示要等 write_finish_toggle 同步后
+reg [1:0]        transition_busy_sync;
+reg [1:0]        transition_done_sync;
+reg              transition_wait;
+wire             publish_image;
+wire             transition_released = !transition_wait &&
+                                      !transition_busy_sync[1];
+
+// Lock locally on the commit edge, before busy can make the round trip.
+// Only the matching persistent acknowledgement releases it. suspend and
+// invalidate must NOT clear this lock: an aborted mode switch can resume
+// images before the memory reader has drained its latched old-frame mapping.
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        transition_busy_sync <= 2'b00;
+        transition_done_sync <= 2'b00;
+        transition_req_toggle <= 1'b0;
+        transition_wait <= 1'b0;
+    end else begin
+        transition_busy_sync <= {transition_busy_sync[0], transition_busy};
+        transition_done_sync <= {transition_done_sync[0], transition_done_toggle};
+        if (publish_image) begin
+            transition_req_toggle <= ~transition_req_toggle;
+            transition_wait <= 1'b1;
+        end else if (transition_wait && !transition_busy_sync[1] &&
+                     transition_done_sync[1] == transition_req_toggle) begin
+            transition_wait <= 1'b0;
+        end
+    end
+end
+
+// Source success and SDRAM completion are independent events. Commit only
+// after both; bmp_ready means idle and must never be used as load success.
 reg              source_done_seen;
 // 整帧写完事件：与 source_done_seen 谁先到都先记住，两个都到齐才提交（避免先后顺序问题）
 reg              write_done_seen;
@@ -190,6 +251,18 @@ always @(posedge clk or posedge rst) begin
     else if (load_wd < LOAD_WD_CYCLES) load_wd <= load_wd + 32'd1;
 end
 wire load_wd_fire = (load_wd >= LOAD_WD_CYCLES);
+assign publish_image = sd_init_done && load_busy &&
+                       source_done_seen && write_done_seen &&
+                       !bmp_load_error && !load_wd_fire &&
+                       !invalidate && !load_discard;
+always @(posedge clk or posedge rst) begin
+    if (rst) begin abort_hold<=0; writer_idle_sync<=0; end
+    else begin
+        writer_idle_sync <= {writer_idle_sync[0],write_idle};
+        if (bmp_load_error || (load_busy && load_wd_fire)) abort_hold<=4'd15;
+        else if (abort_hold!=0) abort_hold<=abort_hold-4'd1;
+    end
+end
 
 // ---------------- 诊断：统计本次加载收到的像素数 ----------------
 // bmp_data_wr_en 每收满一个像素（3 字节）拉高一拍，正常一帧应收到 307200 个。
@@ -208,12 +281,8 @@ always @(posedge clk or posedge rst) begin
     end
 end
 
-// 【踩过的坑，不要再加回来】
-// 曾经在这里加过“源文件送完后等 1ms 就提交”（想摆脱对 write_finish 脉冲的依赖），
-// 结果上电第一张图变成灰黑乱码。原因：bmp_read 的 ready = (state == ST_IDLE)，
-// 它是“空闲可接收”而不是“送完了”，load_busy 一拉高它还是 1，
-// 所以 source_done_seen 在加载刚开始就被置起，1ms 后提交的是几乎空的缓冲区。
-// 结论：提交必须等真正的整帧写完事件 write_done_seen，看门狗只做兜底。
+// Never commit on a delay or on parser idle: invalid/short files also return
+// to idle. bmp_load_done follows the final accepted scaled pixel exclusively.
 
 // 屏幕方块诊断（与顶层注释一一对应）：
 // [7]display_valid [6]load_busy [5]source_done_seen [4]short_load(1=这一帧没收全)
@@ -303,7 +372,9 @@ always @(posedge clk or posedge rst) begin
         img_sector2           <= 32'd0;
         img_sector3           <= 32'd0;
         next_req_pending      <= 1'b0;
+        auto_req_pending      <= 1'b0;
         load_busy             <= 1'b0;
+        load_discard          <= 1'b0;
         source_done_seen      <= 1'b0;
         write_done_seen       <= 1'b0;
         display_valid         <= 1'b0;
@@ -329,7 +400,9 @@ always @(posedge clk or posedge rst) begin
             img_sector2           <= 32'd0;
             img_sector3           <= 32'd0;
             next_req_pending      <= 1'b0;
+            auto_req_pending      <= 1'b0;
             load_busy             <= 1'b0;
+            load_discard          <= 1'b0;
             source_done_seen      <= 1'b0;
             write_done_seen       <= 1'b0;
             display_valid         <= 1'b0;
@@ -351,29 +424,30 @@ always @(posedge clk or posedge rst) begin
 
             // 记住两个“完成”事件：源文件送完 FIFO、整帧写完 SDRAM。
             // 谁先到都先记住，不再要求“同一时刻同时成立”（那是原来不出图的第二个原因）
-            if (load_busy && bmp_ready)
+            if (load_busy && bmp_load_done)
                 source_done_seen <= 1'b1;
 
             if (load_busy && write_finish_pulse)
                 write_done_seen  <= 1'b1;
 
-            // 真正整帧写完（write_done_seen）才提交新图并切换显示缓冲区。
-            // 注意：source_done_seen 其实在加载一开始就被置起了（见文件上方“踩过的坑”），
-            // 所以这里的实质判据是 write_done_seen，看门狗负责兜底。
-            if (load_busy && source_done_seen && write_done_seen) begin
+            // Successful raster output and completed SDRAM write are both
+            // required before changing the displayed buffer.
+            if (load_busy && source_done_seen && write_done_seen && !bmp_load_error && !load_wd_fire) begin
                 load_busy             <= 1'b0;
                 source_done_seen      <= 1'b0;
                 write_done_seen       <= 1'b0;
-                disp_buf_idx          <= pending_buf_idx;
-                img_idx               <= load_idx;
-                display_valid         <= 1'b1;
-                first_image_committed <= 1'b1;
+                if (publish_image) begin
+                    disp_buf_idx          <= pending_buf_idx;
+                    img_idx               <= load_idx;
+                    display_valid         <= 1'b1;
+                    first_image_committed <= 1'b1;
+                end
             end
 
             // 看门狗兜底：加载超时（正常 <1 秒，超时说明真卡住了）。
             // 【重要修正】超时只“中止加载”，绝不提交：原来超时会强行 commit，
             // 把一块根本没写完的 SDRAM 区当图片显示 → 屏幕上就是彩色乱码/条纹。
-            if (load_busy && load_wd_fire && !(source_done_seen && write_done_seen)) begin
+            if (load_busy && (bmp_load_error || load_wd_fire)) begin
                 load_busy        <= 1'b0;
                 source_done_seen <= 1'b0;
                 write_done_seen  <= 1'b0;
@@ -394,6 +468,7 @@ always @(posedge clk or posedge rst) begin
                 write_buf_idx         <= 2'd0;
                 disp_buf_idx          <= 2'd0;
                 next_req_pending      <= 1'b0;
+                auto_req_pending      <= 1'b0;
                 display_valid         <= 1'b0;
                 load_busy             <= 1'b0;
                 source_done_seen      <= 1'b0;
@@ -411,7 +486,7 @@ always @(posedge clk or posedge rst) begin
                 end
 
                 // 自动播放 1s 计数：只有当前没有写图任务时才计时
-                if (scan_done && auto_play_en && display_valid && !load_busy && first_image_committed && (img_found_count > 3'd1)) begin
+                if (!key_auto_press && scan_done && auto_play_en && display_valid && !load_busy && first_image_committed && (img_found_count > 3'd1)) begin
                     if (auto_tick)
                         auto_cnt <= 32'd0;
                     else
@@ -420,55 +495,70 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt <= 32'd0;
                 end
 
+                // Keep one automatic request across a long transition. A
+                // manual request and an automatic tick coalesce into one load.
+                // Turning auto off cancels only the automatic request.
+                if (key_auto_press)
+                    auto_req_pending <= 1'b0;
+                else if (scan_done && auto_play_en && auto_tick && display_valid &&
+                         !load_busy && first_image_committed && (img_found_count > 3'd1))
+                    auto_req_pending <= 1'b1;
+
                 // 视频模式：停掉自动播放并撤掉挂起的切图请求（这些会去抢 SD 读和 SDRAM 写通道）
                 if (suspend) begin
                     auto_play_en     <= 1'b0;
                     next_req_pending <= 1'b0;
+                    auto_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
 
                 // 首图自动加载到 buffer0
-                if (scan_done && !first_image_committed && bmp_ready && !load_busy && !suspend && (img_found_count != 3'd0)) begin
+                if (scan_done && !first_image_committed && bmp_ready && !load_busy && !suspend && !invalidate && transition_released && !write_abort && writer_idle_sync[1] && (img_found_count != 3'd0)) begin
                     load_idx         <= 2'd0;
                     load_sector      <= img_sector0;
                     pending_buf_idx  <= 2'd0;
                     write_buf_idx    <= 2'd0;
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
+                    load_discard     <= 1'b0;
                     source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
                     wd_seen_r        <= 1'b0;
                     next_req_pending <= 1'b0;
+                    auto_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
-                // 手动下一张优先：写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && next_req_pending && (img_found_count != 3'd0)) begin
+                // Consume requests on this edge as well as queued requests;
+                // this avoids losing a key/timer event at the release boundary.
+                else if (scan_done && bmp_ready && display_valid && !load_busy && !suspend && !invalidate && transition_released && !write_abort && writer_idle_sync[1] &&
+                         (next_req_pending || key_next_press ||
+                          (auto_play_en && !key_auto_press &&
+                           (auto_req_pending || auto_tick) && (img_found_count > 3'd1))) &&
+                         (img_found_count != 3'd0)) begin
                     load_idx         <= next_from_current;
                     load_sector      <= sector_lut(next_from_current);
                     pending_buf_idx  <= single_buf_s ? 2'd0 : next_buf_lut(disp_buf_idx, display_valid);
                     write_buf_idx    <= single_buf_s ? 2'd0 : next_buf_lut(disp_buf_idx, display_valid);
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
+                    load_discard     <= 1'b0;
                     source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
                     wd_seen_r        <= 1'b0;
                     next_req_pending <= 1'b0;
-                    auto_cnt         <= 32'd0;
-                end
-                // 自动播放下一张：同样写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && auto_play_en && auto_tick && (img_found_count > 3'd1)) begin
-                    load_idx         <= next_from_current;
-                    load_sector      <= sector_lut(next_from_current);
-                    pending_buf_idx  <= single_buf_s ? 2'd0 : next_buf_lut(disp_buf_idx, display_valid);
-                    write_buf_idx    <= single_buf_s ? 2'd0 : next_buf_lut(disp_buf_idx, display_valid);
-                    load_start_pulse <= 1'b1;
-                    load_busy        <= 1'b1;
-                    source_done_seen <= 1'b0;
-                    write_done_seen  <= 1'b0;
-                    wd_seen_r        <= 1'b0;
+                    auto_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
             end
+        end
+        if (invalidate) begin
+            display_valid <= 1'b0;
+            first_image_committed <= 1'b0;
+            next_req_pending <= 1'b0;
+            auto_req_pending <= 1'b0;
+            auto_play_en <= 1'b0;
+            auto_cnt <= 32'd0;
+            if (load_busy) load_discard <= 1'b1;
         end
     end
 end
@@ -503,6 +593,10 @@ bmp_read bmp_read_m0(
     .bmp_height             (bmp_height),
     .write_req              (write_req),
     .write_req_ack          (write_req_ack),
+    .bmp_data_ready         (write_ready),
+    .abort                  (load_busy && load_wd_fire),
+    .load_done              (bmp_load_done),
+    .load_error             (bmp_load_error),
     .sd_sec_read            (bmp_sec_read),
     .sd_sec_read_addr       (bmp_sec_read_addr),
     .sd_sec_read_data       (bmp_sec_read_data),
@@ -575,6 +669,8 @@ assign wav_file_sector = fat_wav_sector;
 //    图像侧代价：每 3 个扇区多等约 300us，一张图总时长只多约 15%。
 reg granted_wav;
 reg sec_busy;
+assign storage_idle = !sec_busy && !wd_flush && !bmp_sec_read &&
+                      !wav_sec_read && !fat_req && bmp_ready && !load_busy;
 reg [3:0] bmp_streak;               // 图像连续拿到的扇区数
 localparam [3:0] WAV_QUOTA = 4'd1;  // 图像连拿 2 个后必须让 1 个给音频
 

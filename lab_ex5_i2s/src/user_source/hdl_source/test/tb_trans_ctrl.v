@@ -1,98 +1,116 @@
-// tb_trans_ctrl.v —— 转场控制器专项仿真
-// 验证：1) 效果轮换（滑动 ↔ 淡入淡出，栅格已停用）
-//       2) 滑动每帧 +8 像素，到 640 后 trans_en 归零
-//       3) 淡入淡出 16 帧淡出 → 切新图（trans_en=0）→ 16 帧淡入
 `timescale 1ns/1ps
+// Real default-step controller; no accelerated parameters or forced DUT state.
 module tb_trans_ctrl;
-    reg clk = 0, rst = 1, switch_pulse = 0, frame_done = 0;
+    reg clk=0, rst=1, switch_pulse=0, frame_done=0, abort=0;
     wire [1:0] trans_effect;
-    wire       trans_en;
+    wire trans_en;
     wire [9:0] trans_offset;
     wire [8:0] fade_factor;
-
+    reg test_done=0, test_passed=0;
+    integer errors=0, checks=0, i, fx;
+    reg [21:0] held;
+    always #5 clk=~clk;
     trans_ctrl dut (
-        .clk (clk), .rst (rst),
-        .switch_pulse (switch_pulse), .frame_done (frame_done),
-        .trans_effect (trans_effect), .trans_en (trans_en),
-        .trans_offset (trans_offset), .fade_factor (fade_factor)
+        .clk(clk), .rst(rst), .switch_pulse(switch_pulse),
+        .frame_done(frame_done), .abort(abort), .trans_effect(trans_effect),
+        .trans_en(trans_en), .trans_offset(trans_offset), .fade_factor(fade_factor)
     );
-
-    integer errors = 0;
-    integer i;
-
-    always #5 clk = ~clk;   // 100MHz
-
-    task do_switch;
+    task check;
+        input condition;
+        input [8*120-1:0] message;
         begin
-            @(negedge clk); switch_pulse = 1;
-            @(negedge clk); switch_pulse = 0;
-            @(negedge clk);
-        end
-    endtask
-
-    task one_frame;
-        begin
-            @(negedge clk); frame_done = 1;
-            @(negedge clk); frame_done = 0;
-            @(negedge clk);
-        end
-    endtask
-
-    task expect2(input [1:0] e_effect, input e_en, input [9:0] e_off, input [8:0] e_fade, input [127:0] tag);
-        begin
-            if (trans_effect !== e_effect || trans_en !== e_en ||
-                trans_offset !== e_off || fade_factor !== e_fade) begin
-                $display("FAIL [%0s] effect=%0d(exp %0d) en=%b(exp %b) off=%0d(exp %0d) fade=%0d(exp %0d)",
-                         tag, trans_effect, e_effect, trans_en, e_en, trans_offset, e_off, fade_factor, e_fade);
-                errors = errors + 1;
-            end else begin
-                $display("ok   [%0s] effect=%0d en=%b off=%0d fade=%0d", tag, trans_effect, trans_en, trans_offset, fade_factor);
+            checks=checks+1;
+            if (condition !== 1'b1) begin
+                errors=errors+1;
+                $display("FAIL trans_ctrl t=%0t %0s fx=%0d en=%b off=%0d fade=%0d",
+                         $time,message,trans_effect,trans_en,trans_offset,fade_factor);
             end
         end
     endtask
-
+    task expect_state;
+        input [1:0] effect;
+        input enabled;
+        input [9:0] offset;
+        input [8:0] fade;
+        begin
+            check({trans_effect,trans_en,trans_offset,fade_factor} ===
+                  {effect,enabled,offset,fade},"exact effect/en/offset/fade");
+        end
+    endtask
+    task hold_frame;
+        begin
+            held={trans_effect,trans_en,trans_offset,fade_factor};
+            repeat (7) begin
+                @(negedge clk);
+                check({trans_effect,trans_en,trans_offset,fade_factor} === held,
+                      "parameters stable inside frame");
+            end
+        end
+    endtask
+    task one_frame;
+        begin
+            hold_frame;
+            frame_done=1;
+            @(negedge clk); frame_done=0;
+        end
+    endtask
+    task do_switch;
+        begin
+            @(negedge clk); switch_pulse=1;
+            @(negedge clk); switch_pulse=0;
+        end
+    endtask
+    task complete_effect;
+        input integer effect;
+        integer n, expected_offset;
+        begin
+            expect_state(effect,1'b1,10'd0,9'd256);
+            if (effect == 1 || effect == 0) begin
+                for (n=1; n <= (effect == 1 ? 35 : 80); n=n+1) begin
+                    one_frame;
+                    expected_offset=effect == 1 ? (n*2 > 69 ? 69 : n*2) : n*8;
+                    expect_state(effect,1'b1,expected_offset,9'd256);
+                end
+                // GRID displays progress 69 for a full frame before disabling.
+                hold_frame; one_frame;
+                expect_state(effect,1'b0,effect == 1 ? 10'd69 : 10'd640,9'd256);
+            end else begin
+                for (n=1; n <= 16; n=n+1) begin
+                    one_frame; expect_state(2'd2,n < 16,10'd0,256-n*16);
+                end
+                for (n=1; n <= 16; n=n+1) begin
+                    one_frame; expect_state(2'd2,1'b0,10'd0,n*16);
+                end
+            end
+            $display("COVER trans_ctrl complete fx=%0d",effect);
+        end
+    endtask
     initial begin
         repeat (5) @(negedge clk);
-        rst = 0;
-        repeat (2) @(negedge clk);
-        expect2(2'd0, 1'b0, 10'd0, 9'd256, "复位后=滑动待机");
-
-        // ---- 第 1 次切图：应该跑"淡入淡出" ----
-        do_switch;
-        expect2(2'd2, 1'b1, 10'd0, 9'd256, "切图1->淡出开始");
-        for (i = 0; i < 15; i = i + 1) one_frame;
-        expect2(2'd2, 1'b1, 10'd0, 9'd16, "淡出15帧 fade=16");
-        one_frame;
-        expect2(2'd2, 1'b0, 10'd0, 9'd0, "淡出结束 en=0(换新图)");
-        for (i = 0; i < 8; i = i + 1) one_frame;
-        expect2(2'd2, 1'b0, 10'd0, 9'd128, "淡入中 fade=128");
-        for (i = 0; i < 8; i = i + 1) one_frame;
-        expect2(2'd2, 1'b0, 10'd0, 9'd256, "淡入结束 fade=256");
-
-        // ---- 第 2 次切图：应该跑"滑动" ----
-        do_switch;
-        expect2(2'd0, 1'b1, 10'd0, 9'd256, "切图2->滑动开始");
-        one_frame;
-        expect2(2'd0, 1'b1, 10'd8, 9'd256, "滑动1帧 off=8");
-        for (i = 0; i < 78; i = i + 1) one_frame;
-        expect2(2'd0, 1'b1, 10'd632, 9'd256, "滑动79帧 off=632");
-        one_frame;
-        expect2(2'd0, 1'b1, 10'd640, 9'd256, "滑动80帧 off=640");
-        one_frame;
-        expect2(2'd0, 1'b0, 10'd640, 9'd256, "滑动结束 en=0");
-
-        // ---- 第 3 次切图：又回到淡入淡出（轮换正确）----
-        do_switch;
-        expect2(2'd2, 1'b1, 10'd0, 9'd256, "切图3->淡出开始(轮换正确)");
-
-        if (errors == 0) $display("CHECK: PASS");
-        else             $display("CHECK: FAIL errors=%0d", errors);
+        expect_state(2'd0,1'b0,10'd0,9'd256);
+        rst=0; hold_frame;
+        // Two full rotations include GRID first and wraparound.
+        for (i=0; i < 6; i=i+1) begin
+            fx=(i+1)%3; do_switch; complete_effect(fx);
+        end
+        for (i=0; i < 3; i=i+1) begin
+            fx=(i+1)%3; do_switch; one_frame;
+            expect_state(fx,1'b1,fx == 1 ? 10'd2 : (fx == 0 ? 10'd8 : 10'd0),
+                         fx == 2 ? 9'd240 : 9'd256);
+            abort=1; @(negedge clk);
+            expect_state(fx,1'b0,10'd640,9'd256);
+            one_frame;
+            expect_state(fx,1'b0,10'd640,9'd256);
+            abort=0; hold_frame;
+            $display("COVER trans_ctrl abort fx=%0d",fx);
+        end
+        test_passed=(errors == 0); test_done=1;
+        $display("TRANS_CTRL_RESULT passed=%b checks=%0d errors=%0d",test_passed,checks,errors);
         $finish;
     end
-
     initial begin
-        #5000000;
-        $display("CHECK: TIMEOUT");
-        $finish;
+        #2000000;
+        errors=errors+1; test_passed=0; test_done=1;
+        $display("FAIL trans_ctrl TIMEOUT"); $finish;
     end
 endmodule

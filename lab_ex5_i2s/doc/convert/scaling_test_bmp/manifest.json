@@ -1,0 +1,50 @@
+[
+  {
+    "file": "0.BMP",
+    "width": 320,
+    "height": 240,
+    "top_down": false,
+    "stride": 960,
+    "fit_width": 640,
+    "fit_height": 480,
+    "left": 0,
+    "top": 0,
+    "size_bytes": 230454
+  },
+  {
+    "file": "1.BMP",
+    "width": 1920,
+    "height": 1080,
+    "top_down": false,
+    "stride": 5760,
+    "fit_width": 640,
+    "fit_height": 360,
+    "left": 0,
+    "top": 60,
+    "size_bytes": 6220854
+  },
+  {
+    "file": "2.BMP",
+    "width": 241,
+    "height": 479,
+    "top_down": true,
+    "stride": 724,
+    "fit_width": 241,
+    "fit_height": 480,
+    "left": 199,
+    "top": 0,
+    "size_bytes": 346850
+  },
+  {
+    "file": "3.BMP",
+    "width": 641,
+    "height": 481,
+    "top_down": false,
+    "stride": 1924,
+    "fit_width": 639,
+    "fit_height": 480,
+    "left": 0,
+    "top": 0,
+    "size_bytes": 925498
+  }
+]

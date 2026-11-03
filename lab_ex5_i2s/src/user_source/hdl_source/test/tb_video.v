@@ -11,6 +11,7 @@
 `timescale 1ns/1ps
 
 module tb_video;
+    reg test_passed = 0;
 
     localparam integer CLK_HZ   = 100_000_000;
     localparam integer SRC_W    = 320;
@@ -20,9 +21,8 @@ module tb_video;
     localparam integer TOTAL_SEC     = 1 + FRAMES*SEC_PER_FRAME;
     localparam integer WORDS_FRAME   = 640*480;         // 307200
     localparam integer WORDS_GROUP   = 5120;
-    // 仿真加速：头部 fps 写成 2000（真机是 25），节拍 0.5ms 而不是 40ms，
-    // 否则跑 2 帧要 9 千万拍。节拍逻辑本身照样被完整执行到。
-    localparam integer FPS_SIM       = 2000;
+    // 保留合法的 25fps 头部，用较小 CLK_FREQ_HZ 加速帧节拍。
+    localparam integer FPS_SIM       = 25;
     // 整型参数不能做位选（Verilog-2001），转成 16 位再取字节
     localparam [15:0] SRC_W16   = SRC_W;
     localparam [15:0] SRC_H16   = SRC_H;
@@ -53,7 +53,7 @@ module tb_video;
     wire        active;
 
     video_player #(
-        .CLK_FREQ_HZ (CLK_HZ),
+        .CLK_FREQ_HZ (1_000_000),
         .SCAN_START  (32'd0),
         .SCAN_MAX    (32'd131071),
         .SRC_W       (SRC_W),
@@ -62,6 +62,8 @@ module tb_video;
         .clk                 (clk),
         .rst                 (rst),
         .enable              (enable),
+        .file_valid          (1'b1),
+        .file_sector         (32'd0),
         .sec_read            (sec_read),
         .sec_read_addr       (sec_read_addr),
         .sec_read_data       (sec_read_data),
@@ -69,13 +71,16 @@ module tb_video;
         .sec_read_end        (sec_read_end),
         .wr_req              (wr_req),
         .wr_req_ack          (wr_req_ack),
+        .write_ready         (1'b1),
         .wr_en               (wr_en),
         .wr_data             (wr_data),
         .wr_finish           (wr_finish),
+        .wr_abort            (),
         .display_valid       (display_valid),
         .disp_buf_idx        (disp_buf_idx),
         .write_buf_idx       (write_buf_idx),
-        .active              (active)
+        .active              (active),
+        .st_dbg              ()
     );
 
     // ---------------- 假 .VID 存储 ----------------
@@ -92,7 +97,7 @@ module tb_video;
         mem[0] = "V"; mem[1] = "I"; mem[2] = "D"; mem[3] = "1";
         mem[4] = SRC_W16[7:0];   mem[5]  = SRC_W16[15:8];
         mem[6] = SRC_H16[7:0];   mem[7]  = SRC_H16[15:8];
-        mem[8] = FPS16[7:0];     mem[9]  = FPS16[15:8];   // fps（仿真用 2000）
+        mem[8] = FPS16[7:0];     mem[9]  = FPS16[15:8];   // 合法的 25fps
         mem[10] = FRAMES16[7:0]; mem[11] = 8'd0; mem[12] = 8'd0; mem[13] = 8'd0;
         for (k = 14; k < 512; k = k + 1) mem[k] = 8'd0;
 
@@ -231,10 +236,13 @@ module tb_video;
         if (bad_cnt == 0 && frame_cnt >= FRAMES)
             $display("RESULT: PASS frames=%0d words=%0d ok=%0d bad=%0d cycles=%0d",
                      frame_cnt, ok_cnt + bad_cnt, ok_cnt, bad_cnt, guard);
-        else
+        else begin
             $display("RESULT: FAIL frames=%0d words=%0d ok=%0d bad=%0d cycles=%0d",
                      frame_cnt, ok_cnt + bad_cnt, ok_cnt, bad_cnt, guard);
+            $fatal(1,"Video pixel regression failed");
+        end
         $display("--------------------------------------------------");
+        test_passed = 1;
         $finish;
     end
 

@@ -1,19 +1,4 @@
-// ============================================================
-// wav_audio.v —— TF 卡 WAV 播放（HDMI 音频输出）
-//
-// 全部自包含，不依赖 TD 的 FIFO IP：
-//   sd_clk 域：扫描 RIFF/WAVE 头 → 流式读扇区 → 组装 16bit 立体声
-//              → 写入 512×32 环形缓冲（自动推断 BRAM）
-//              → 48kHz 节拍取样本 → 四相握手送给视频域
-//   vid_clk 域：握手接收 → 16bit 转 24bit → 送 HDMI 音频接口
-//
-// 扇区读接口接到 sd_card_bmp 的 WAV 通道（内部与图像请求仲裁，图像优先，
-// 一次事务内不切换，所以绝不会打断 SD 卡正在执行的命令）。
-//
-// 注意：找到头之后从"头所在扇区的下一个扇区"开始送数据，
-//       会丢掉开头 468 字节（约 2.4ms），听感无影响；
-//       播到 data 块末尾自动回到开头循环。
-// ============================================================
+// RIFF PCM reader: exact byte boundaries, complete-sector staging, precise loop.
 module wav_audio #(
     parameter integer SD_CLK_HZ    = 50_000_000,
     parameter integer VID_CLK_HZ   = 25_000_000,
@@ -21,9 +6,9 @@ module wav_audio #(
     parameter [31:0]  SCAN_START   = 32'd0,
     parameter [31:0]  SCAN_MAX     = 32'd131071,
     // 自检音：1 = 不读 SD 数据，在视频域自己产生 1kHz 三角波 + 约 0.7s 通断
-    // 0 = 正常播放 WAV；1 = 输出通路自检音；2 = 缓冲自检（写已知正弦，不读 SD）
+    // 0 = 正常播放 WAV；1 = 输出通路自检音；2 = 缓冲自检（写已知三角波，不读 SD）
     parameter  [1:0]  SELFTEST     = 2'd0,
-    // 期望校验和：PC 端对卡上文件 data_start 起前 4 扇区(2048B) 求和取低 16 位
+    // 期望校验和：兼容旧工具：RIFF 起始 LBA+1 起 4 个物理扇区(2048B)求和取低16位
     parameter  [15:0] SUM_EXPECT   = 16'hF5E2
 )(
     input  wire        sd_clk,
@@ -48,229 +33,329 @@ module wav_audio #(
     output reg  [23:0] aud_left,
     output reg  [23:0] aud_right,
     output wire        playing,
-    output reg  [15:0] sum16,          // 前 4 个流式扇区的字节和（冻结）
+    output wire        active,
+    output reg  [15:0] sum16,          // RIFF 首扇区之后 4 个物理扇区的字节和（兼容旧诊断）
     output wire        sum_ok
 );
 
-    // ==================== 样本环形缓冲（sd 域，512×32 推断 BRAM）====================
-    // [容错] 4096 样本 = 85.3ms 缓冲（原 512 样本 = 10.7ms）。
-    // 真卡若偶发“整块读延迟 >10ms”，老缓冲会被抽干 → 持续沙沙声；85ms 足以吸收两三次抖动。
-    // 必须推断成块 RAM：512×32 落 LUT 就要 2754 个 LUT4，4096×32 更不可能。
+
+    // Only complete physical sectors are exposed to the parser. A failed read
+    // is retried at the same LBA without changing parser/FIFO/checksum state.
+    // Three cycles per byte isolate the BRAM output from parser decoding.
+    reg [7:0] sector_mem [0:511];
+    reg [7:0] sector_ram_q, sector_q;
+    reg [9:0] rx_count;
+    reg [8:0] parse_idx, read_offset, data_start_off;
+    reg [31:0] addr, base_lba, data_start;
+    reg [24:0] to_cnt;
+    reg draining;
+    wire [10:0] rx_total = {1'b0, rx_count} + (sec_read_data_valid ? 11'd1 : 11'd0);
+
     reg [31:0] sbuf [0:4095];
-    reg [11:0] wrp, rdp;
-    // SELFTEST==2 时用独立写指针（避免和状态机抢同一个 wrp 造成多驱动）
-    reg [11:0] wrp_cf;
+    reg [11:0] wrp, rdp, wrp_cf;
     reg [15:0] cf_ph;
-    reg [15:0] sum_acc;
-    reg [1:0]  sum_sec;
-    reg [15:0] sec_sum;
-    wire [15:0] cf_s16 = cf_ph[15] ? (16'hFFFF - cf_ph) : cf_ph;   // 1kHz 三角波
+    wire [15:0] cf_s16 = cf_ph[15] ? (16'hffff - cf_ph) : cf_ph;
     wire [11:0] wrp_eff = (SELFTEST == 2'd2) ? wrp_cf : wrp;
+    wire [11:0] buf_cnt = wrp_eff - rdp;
+    wire buf_empty = (wrp_eff == rdp);
+    wire sbuf_re;
+    wire buf_room = (buf_cnt != 12'd4095); // reserve one entry: full != empty
+
+    localparam S_IDLE=4'd0, S_REQ=4'd1, S_RX=4'd2,
+               S_LOAD=4'd3, S_PARSE=4'd4, S_BAD=4'd5,
+               S_RIFF_LIMIT=4'd6, S_RIFF_LAST=4'd7, S_RIFF_LBA=4'd8,
+               S_RIFF_CHECK=4'd9, S_CHUNK_SUM=4'd10, S_CHUNK_PAD=4'd11,
+               S_CHUNK_CHECK=4'd12, S_CHUNK_APPLY=4'd13, S_HEADER_CHECK=4'd14,
+               S_FETCH=4'd15;
+    localparam P_RIFF=3'd0, P_CHUNK=3'd1, P_FMT=3'd2,
+               P_SKIP=3'd3, P_PAD=3'd4, P_PCM=3'd5;
+    reg [3:0] st, parse_resume;
+    reg [2:0] parser;
+    reg started, streaming, fmt_ok;
+    reg [3:0] field_idx;
+    reg [95:0] riff_hdr;
+    reg [127:0] fmt_hdr;
+    reg [31:0] chunk_id, chunk_size, chunk_left;
+    reg chunk_pad;
+    reg [31:0] file_pos, riff_end, riff_last, data_length, data_left;
+    reg [1:0] pcm_phase;
+    reg [15:0] l16;
+    reg [7:0] r_low;
+    reg [15:0] sum_acc, sec_sum;
+    reg [2:0] sum_sec;
+
+    wire [31:0] incoming_size = {sector_q, chunk_size[23:0]};
+    // Each arithmetic step ends at a register; validation stalls the parser.
+    // Widen before addition so malformed lengths cannot wrap past RIFF.
+    reg [32:0] riff_limit_q, riff_last_q, last_lba_q;
+    reg [32:0] header_end_q, payload_end_q, padded_end_q;
+    reg riff_header_ok, chunk_fits;
+    reg metadata_at_end, data_chunk_ok, fmt_chunk_ok, chunk_empty;
+    reg [1:0] chunk_kind;
+    reg [32:0] checksum_lba_q;
+    reg checksum_sector;
+    assign playing = streaming;
+    assign active = (st != S_IDLE) && (st != S_BAD);
     assign sum_ok = (sum16 == SUM_EXPECT);
 
-    wire [11:0] buf_cnt = wrp_eff - rdp;
-    wire       buf_empty = (wrp_eff == rdp);
-
-    // ==================== 状态机（sd 域）====================
-    // 跳转模式下只容忍文件首扇区后 3 个扇区
-    wire [31:0] scan_stop = file_valid ? (file_sector + 32'd3) : SCAN_MAX;
-
-    localparam S_IDLE     = 3'd0;
-    localparam S_SCAN_REQ = 3'd1;
-    localparam S_SCAN_DAT = 3'd2;
-    localparam S_STR_REQ  = 3'd3;
-    localparam S_STR_DAT  = 3'd4;
-
-    reg [2:0]   st;
-    reg [31:0]  addr;
-    reg [9:0]   byte_cnt;
-    reg [351:0] hdr;                 // 44 字节文件头
-    reg [15:0]  l16;                 // 组装的左声道
-    reg [7:0]   r_low;               // 右声道低字节
-    reg         streaming;
-    reg [24:0]  to_cnt;   // S_STR_DAT 超时计数（看门狗强拆事务时自恢复）
-    reg         draining; // 超时后丢弃本块剩余字节、等 end 收尾（避免整块重复+半帧错位）
-    // 【2026-10-28 修·只收“完整块”】每个扇区开始前记下写指针，块不完整（被强拆/超时/字节数≠512）
-    //   就回滚到块首，绝不把半块样本留在缓冲里 —— 半块是“从第一个音符起就沙沙响”的直接成因。
-    reg [11:0]  wrp_blk;
-    reg [31:0]  data_left;           // 剩余数据字节（循环用）
-    reg [31:0]  data_start;
-
-    assign playing = streaming;
-
-    // FIFO 有空间才读下一个扇区。
-    // 【必须留一格】wrp==rdp 既是“空”也是“满”的表示：若允许写到正好 512，
-    // 指针相等会被当成空 → 读指针不再前进、写指针继续跑 → 指针永久错位，
-    // 之后放出来的就是垃圾数据（持续刺耳噪音，且切图也回不来）。
-    // 一个扇区最多加 128 个样本，所以阈值取 383 时最大只到 511，永不满格。
-    // 【必须留一格】wrp==rdp 既是“空”也是“满”的表示：允许写到 4095 就不能再写，
-    // 否则计数绕回 0 会被当成“空”，读写指针永久错位（噪音）。
-    // 512 样本 = 10.7ms。**【不要再加大】** 这种小数组 TD 会做成分布式 RAM（吃 LUT/切片），
-    // 4096 样本会把 mslice 顶到 6626 > 4900 直接超限；音频不断音靠的是
-    // “配额仲裁 + 只在扇区边界让路”，不是靠缓冲深度。
-    wire buf_room = (buf_cnt <= 12'd3967);   // 不允许写满，避免满/空二义
+    always @(posedge sd_clk) begin
+        if (st == S_RX && sec_read_data_valid && rx_count < 10'd512)
+            sector_mem[rx_count[8:0]] <= sec_read_data;
+        sector_ram_q <= sector_mem[parse_idx];
+        sector_q <= sector_ram_q;
+    end
 
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
-            st            <= S_IDLE;
-            sec_read      <= 1'b0;
-            sec_read_addr <= 32'd0;
-            addr          <= SCAN_START;
-            byte_cnt      <= 10'd0;
-            hdr           <= 352'd0;
-            l16           <= 16'd0;
-            r_low         <= 8'd0;
-            streaming     <= 1'b0;
-            data_left     <= 32'd0;
-            data_start    <= 32'd0;
-            draining      <= 1'b0;
-            wrp_blk       <= 12'd0;
-            to_cnt        <= 25'd0;
-            sum_acc       <= 16'd0;
-            sec_sum       <= 16'd0;
-            sum_sec       <= 2'd0;
-            sum16         <= 16'd0;
-            wrp <= 12'd0;
-            // 注意：rdp 只在下面"48kHz 节拍 + 握手"那个 always 块里驱动
-            //      （包括它的复位），否则综合器会报 multiple drivers
+            st <= S_IDLE; parse_resume <= S_LOAD; parser <= P_RIFF;
+            started <= 0; streaming <= 0; fmt_ok <= 0;
+            sec_read <= 0; sec_read_addr <= 0;
+            addr <= SCAN_START; base_lba <= SCAN_START;
+            rx_count <= 0; parse_idx <= 0; read_offset <= 0;
+            data_start <= 0; data_start_off <= 0;
+            to_cnt <= 0; draining <= 0;
+            field_idx <= 0; riff_hdr <= 0; fmt_hdr <= 0;
+            chunk_id <= 0; chunk_size <= 0; chunk_left <= 0; chunk_pad <= 0;
+            file_pos <= 0; riff_end <= 0; riff_last <= 0; data_length <= 0; data_left <= 0;
+            riff_limit_q <= 0; riff_last_q <= 0; last_lba_q <= 0;
+            header_end_q <= 0; payload_end_q <= 0; padded_end_q <= 0;
+            riff_header_ok <= 0; chunk_fits <= 0;
+            metadata_at_end <= 0; data_chunk_ok <= 0; fmt_chunk_ok <= 0;
+            chunk_empty <= 0; chunk_kind <= 0;
+            checksum_lba_q <= 0; checksum_sector <= 0;
+            pcm_phase <= 0; l16 <= 0; r_low <= 0; wrp <= 0;
+            sum_acc <= 0; sec_sum <= 0; sum_sec <= 0; sum16 <= 0;
         end else begin
             case (st)
-                // ---------- 等待使能 ----------
                 S_IDLE: begin
-                    sec_read <= 1'b0;
-                    if (enable) begin
-                        if (streaming) begin
-                            // 之前已经在放：直接从当前扇区继续
-                            // （让路只在扇区边界发生，字节对齐没被打断）
-                            st <= S_STR_REQ;
-                        end else begin
+                    sec_read <= 0;
+                    if (enable && SELFTEST == 2'd0) begin
+                        if (!started) begin
                             addr <= file_valid ? file_sector : SCAN_START;
-                            st   <= S_SCAN_REQ;
+                            base_lba <= file_valid ? file_sector : SCAN_START;
+                            started <= 1;
                         end
+                        st <= S_REQ;
                     end
                 end
-
-                // ---------- 扫描：发起扇区读 ----------
-                S_SCAN_REQ: begin
-                    sec_read      <= 1'b1;
-                    sec_read_addr <= addr;
-                    byte_cnt      <= 10'd0;
-                    st            <= S_SCAN_DAT;
+                S_REQ: begin
+                    checksum_lba_q <= {1'b0,base_lba} + 33'd1 + sum_sec;
+                    if (!enable) st <= S_IDLE;
+                    else begin
+                        sec_read <= 1; sec_read_addr <= addr;
+                        rx_count <= 0; sec_sum <= 0; to_cnt <= 0; draining <= 0;
+                        st <= S_RX;
+                    end
                 end
-
-                // ---------- 扫描：收数据 + 校验头 ----------
-                S_SCAN_DAT: begin
+                S_RX: begin
+                    // LBA is stable for a whole sector. Finish its comparison
+                    // well before the last byte/checksum update arrives.
+                    checksum_sector <= {1'b0,addr} == checksum_lba_q;
                     if (sec_read_data_valid) begin
-                        if (byte_cnt < 10'd44)
-                            hdr[byte_cnt*8 +: 8] <= sec_read_data;
-                        byte_cnt <= byte_cnt + 10'd1;
-                    end
-                    if (sec_read_end) begin
-                        sec_read <= 1'b0;
-                        if (hdr[31:0]    == 32'h46464952 &&   // "RIFF"
-                            hdr[95:64]   == 32'h45564157 &&   // "WAVE"
-                            hdr[175:160] == 16'd1        &&   // PCM
-                            hdr[191:176] == 16'd2        &&   // 2 声道
-                            hdr[223:192] == 32'd48000    &&   // 48kHz
-                            hdr[287:272] == 16'd16       &&   // 16bit
-                            hdr[319:288] == 32'h61746164) begin // "data"
-                            streaming  <= 1'b1;
-                            addr       <= addr + 32'd1;
-                            data_start <= addr + 32'd1;
-                            data_left  <= (hdr[351:320] > 32'd468)
-                                          ? (hdr[351:320] - 32'd468) : 32'd0;
-                            st         <= S_STR_REQ;
-                        end else if (addr < scan_stop) begin
-                            addr <= addr + 32'd1;
-                            st   <= S_SCAN_REQ;
-                        end else begin
-                            st <= S_IDLE;          // 没找到 WAV，保持测试音
-                        end
-                    end
-                end
-
-                // ---------- 流式：等缓冲有空间再读下一扇区 ----------
-                S_STR_REQ: begin
-                    // 不在这里停：仲裁器已经让图像请求优先，WAV 只在图像的空档里
-                    // 插一个扇区（约 300us），而音乐流只要 192KB/s，完全喂得饱。
-                    // 中途停会把缓冲排空 + 指针错位，那正是“切图后音乐变噪音”的来源。
-                    // 真的要让路（进视频模式）时，只在扇区边界停 —— 见 S_STR_DAT。
-                    if (buf_room) begin
-                        sec_read      <= 1'b1;
-                        sec_read_addr <= addr;
-                        byte_cnt      <= 10'd0;
-                        to_cnt        <= 25'd0;
-                        draining      <= 1'b0;
-                        sec_sum       <= 16'd0;
-                        wrp_blk       <= wrp;              // 记下块首，块不完整就回滚
-                        st            <= S_STR_DAT;
-                    end
-                end
-
-                // ---------- 流式：收数据并组装样本 ----------
-                S_STR_DAT: begin
-                    if (sec_read_data_valid && !draining) begin
-                        sec_sum <= sec_sum + {8'd0, sec_read_data};
-                        case (byte_cnt[1:0])
-                            2'd0: l16[7:0]  <= sec_read_data;
-                            2'd1: l16[15:8] <= sec_read_data;
-                            2'd2: r_low     <= sec_read_data;
-                            2'd3: begin
-                                // 数据写入在模块末尾的专用 always 块里（为了被推断成块 RAM）
-                                wrp <= wrp + 12'd1;
-                            end
-                        endcase
-                        byte_cnt <= byte_cnt + 10'd1;
-                    end
-                    // 【2026-10-28 修·根因】超时后不再“原地重发同一个扇区”，而是进入 drain：
-                    //   把这一块剩下的字节全部丢弃、等它真正的 end 来收尾（地址/计数照常前进），
-                    //   否则旧块的尾巴会以 byte_cnt=0 的身份被拼成新块的开头 → 整块重复 + 半帧错位
-                    //   = 从头到尾的沙沙噪音。sd_card_bmp 侧已保证被强拆的主一定能拿到 end。
-                    if (sec_read_data_valid) to_cnt <= 25'd0;
-                    else if (!draining && to_cnt >= 25'd2_000_000) begin  // 20ms @100MHz
-                        draining <= 1'b1;                 // 不再收字节，等 end
-                        wrp      <= wrp_blk;              // 半块样本整体丢弃（不留噪音）
-                        l16      <= 16'd0;                // 丢弃半帧
-                        r_low    <= 8'd0;
-                        to_cnt   <= 25'd0;
-                    end else if (draining && to_cnt >= 25'd4_000_000) begin
-                        // 40ms 还没等到 end：卡真的不回了，强制重同步（相位归零，重发同一扇区）
-                        draining <= 1'b0;
-                        sec_read <= 1'b0;
-                        byte_cnt <= 10'd0;
-                        l16      <= 16'd0;
-                        r_low    <= 8'd0;
-                        to_cnt   <= 25'd0;
-                        st       <= S_STR_REQ;
+                        if (rx_count != 10'd1023) rx_count <= rx_count + 10'd1;
+                        sec_sum <= sec_sum + {8'd0,sec_read_data};
+                        to_cnt <= 0;
+                    end else if (to_cnt == (draining ? 25'd4000000 : 25'd2000000)) begin
+                        to_cnt <= 0;
+                        if (draining) begin
+                            sec_read <= 0; draining <= 0; st <= S_REQ;
+                        end else draining <= 1;
                     end else to_cnt <= to_cnt + 25'd1;
                     if (sec_read_end) begin
-                        sec_read <= 1'b0;
-                        draining <= 1'b0;                 // 收尾完成，恢复正常接收
-                        if (byte_cnt != 10'd512) wrp <= wrp_blk;  // 字节数不对 → 整块丢弃
-                        // 校验和只累计“完整收到 512 字节”的扇区：超时半块或重读不会污染结果
-                        if (byte_cnt == 10'd512 && sum_sec < 2'd4) begin
-                            sum_acc <= sum_acc + sec_sum;
-                            sum_sec <= sum_sec + 2'd1;
-                            if (sum_sec == 2'd3) sum16 <= sum_acc + sec_sum;
-                        end
-                        byte_cnt <= 10'd0;
-                        if (data_left <= 32'd512) begin
-                            addr      <= data_start;      // 循环回开头
-                            data_left <= (hdr[351:320] > 32'd468)
-                                          ? (hdr[351:320] - 32'd468) : 32'd0;  // 回卷同样要减掉 468 字节偏移
-                        end else begin
-                            addr      <= addr + 32'd1;
-                            data_left <= data_left - 32'd512;
-                        end
-                        st <= enable ? S_STR_REQ : S_IDLE;   // 要让路也只在扇区边界停（字节对齐不被打断）
+                        sec_read <= 0;
+                        if (!draining && rx_total == 11'd512) begin
+                            parse_idx <= read_offset;
+                            st <= S_FETCH;
+                            // Keep the existing SUM_EXPECT convention. Retries
+                            // and loops never count the same sector twice.
+                            if (sum_sec < 3'd4 && checksum_sector) begin
+                                sum_acc <= sum_acc + sec_sum +
+                                    (sec_read_data_valid ? {8'd0,sec_read_data} : 16'd0);
+                                sum_sec <= sum_sec + 3'd1;
+                                if (sum_sec == 3'd3)
+                                    sum16 <= sum_acc + sec_sum +
+                                        (sec_read_data_valid ? {8'd0,sec_read_data} : 16'd0);
+                            end
+                        end else st <= S_REQ;
                     end
                 end
-
+                S_FETCH: st <= S_LOAD;
+                S_LOAD: begin
+                    metadata_at_end <= file_pos >= riff_last;
+                    if (parser != P_PCM || pcm_phase != 2'd3 || buf_room)
+                        st <= S_PARSE;
+                end
+                S_PARSE: begin
+                    file_pos <= file_pos + 32'd1;
+                    if (parse_idx == 9'd511) begin
+                        addr <= addr + 32'd1;
+                        read_offset <= 0;
+                        parse_resume <= S_REQ;
+                        st <= S_REQ;
+                    end else begin
+                        parse_idx <= parse_idx + 9'd1;
+                        parse_resume <= S_FETCH;
+                        st <= S_FETCH;
+                    end
+                    case (parser)
+                        P_RIFF: begin
+                            riff_hdr[field_idx*8 +: 8] <= sector_q;
+                            if (field_idx == 4'd11) begin
+                                field_idx <= 0;
+                                st <= S_RIFF_LIMIT;
+                            end else field_idx <= field_idx + 4'd1;
+                        end
+                        P_CHUNK: begin
+                            if (field_idx < 4) chunk_id[field_idx*8 +: 8] <= sector_q;
+                            else chunk_size[(field_idx-4)*8 +: 8] <= sector_q;
+                            if (field_idx == 0) begin
+                                header_end_q <= {1'b0,file_pos} + 33'd8;
+                                field_idx <= 1;
+                                st <= S_HEADER_CHECK;
+                            end else if (field_idx == 7) begin
+                                field_idx <= 0;
+                                chunk_left <= incoming_size;
+                                chunk_pad <= incoming_size[0];
+                                st <= S_CHUNK_SUM;
+                            end else field_idx <= field_idx + 4'd1;
+                        end
+                        P_FMT: begin
+                            if (field_idx < 16) fmt_hdr[field_idx*8 +: 8] <= sector_q;
+                            // The first 16 bytes form the PCM format. Extension
+                            // bytes are opaque; tag 1 is required (not extensible).
+                            if (field_idx == 15) begin
+                                // Last format byte is arriving on this edge.
+                                if (fmt_hdr[15:0] != 1 || fmt_hdr[31:16] != 2 ||
+                                    fmt_hdr[63:32] != SAMPLE_RATE ||
+                                    fmt_hdr[95:64] != SAMPLE_RATE*4 ||
+                                    fmt_hdr[111:96] != 4 ||
+                                    {sector_q,fmt_hdr[119:112]} != 16)
+                                    st <= S_BAD;
+                                else begin
+                                    fmt_ok <= 1;
+                                    parser <= chunk_left == 1 ? (chunk_pad ? P_PAD : P_CHUNK) : P_SKIP;
+                                    field_idx <= 0;
+                                end
+                            end else field_idx <= field_idx + 4'd1;
+                            chunk_left <= chunk_left - 32'd1;
+                        end
+                        P_SKIP: begin
+                            chunk_left <= chunk_left - 32'd1;
+                            if (chunk_left == 1) begin
+                                parser <= chunk_pad ? P_PAD : P_CHUNK;
+                                field_idx <= 0;
+                            end
+                        end
+                        P_PAD: begin parser <= P_CHUNK; field_idx <= 0; end
+                        P_PCM: begin
+                            case (pcm_phase)
+                                0: l16[7:0] <= sector_q;
+                                1: l16[15:8] <= sector_q;
+                                2: r_low <= sector_q;
+                                3: wrp <= wrp + 12'd1;
+                            endcase
+                            pcm_phase <= pcm_phase + 2'd1;
+                            data_left <= data_left - 32'd1;
+                            if (data_left == 1) begin
+                                // Ignore trailing metadata/sector slack. Re-read
+                                // exactly the first PCM LBA and byte offset.
+                                addr <= data_start; read_offset <= data_start_off;
+                                data_left <= data_length; pcm_phase <= 0;
+                                st <= S_REQ;
+                            end
+                        end
+                        default: st <= S_BAD;
+                    endcase
+                    // RIFF without data stops even if metadata ends at byte 511.
+                    if (parser != P_RIFF && parser != P_PCM &&
+                        metadata_at_end) st <= S_BAD;
+                end
+                // No byte is consumed in these states. parse_resume records
+                // whether the last header byte also exhausted its sector.
+                S_RIFF_LIMIT: begin
+                    riff_limit_q <= {1'b0,riff_hdr[63:32]} + 33'd8;
+                    riff_header_ok <= riff_hdr[31:0] == 32'h46464952 &&
+                                      riff_hdr[95:64] == 32'h45564157 &&
+                                      riff_hdr[63:32] >= 32'd4;
+                    st <= S_RIFF_LAST;
+                end
+                S_RIFF_LAST: begin
+                    riff_last_q <= riff_limit_q - 33'd1;
+                    st <= S_RIFF_LBA;
+                end
+                S_RIFF_LBA: begin
+                    last_lba_q <= {1'b0,base_lba} + {9'd0,riff_last_q[32:9]};
+                    st <= S_RIFF_CHECK;
+                end
+                S_RIFF_CHECK: begin
+                    if (!riff_header_ok || riff_limit_q[32] || last_lba_q[32])
+                        st <= S_BAD;
+                    else begin
+                        riff_end <= riff_limit_q[31:0];
+                        riff_last <= riff_last_q[31:0];
+                        parser <= P_CHUNK;
+                        st <= parse_resume;
+                    end
+                end
+                S_HEADER_CHECK: begin
+                    st <= header_end_q > {1'b0,riff_end} ? S_BAD : parse_resume;
+                end
+                S_CHUNK_SUM: begin
+                    // file_pos has already advanced to payload byte zero and
+                    // chunk_size contains all four bytes, even at byte 511.
+                    payload_end_q <= {1'b0,file_pos} + {1'b0,chunk_size};
+                    st <= S_CHUNK_PAD;
+                end
+                S_CHUNK_PAD: begin
+                    padded_end_q <= payload_end_q + {32'd0,chunk_pad};
+                    st <= S_CHUNK_CHECK;
+                end
+                S_CHUNK_CHECK: begin
+                    chunk_fits <= padded_end_q <= {1'b0,riff_end};
+                    fmt_chunk_ok <= !fmt_ok && chunk_size >= 32'd16;
+                    data_chunk_ok <= fmt_ok && chunk_size != 0 && chunk_size[1:0] == 0;
+                    chunk_empty <= chunk_size == 0;
+                    chunk_kind <= chunk_id == 32'h20746d66 ? 2'd1 :
+                                  chunk_id == 32'h61746164 ? 2'd2 : 2'd0;
+                    st <= S_CHUNK_APPLY;
+                end
+                S_CHUNK_APPLY: begin
+                    st <= parse_resume;
+                    if (!chunk_fits) st <= S_BAD;
+                    else if (chunk_kind == 2'd1) begin // fmt
+                        if (!fmt_chunk_ok) st <= S_BAD;
+                        else begin parser <= P_FMT; fmt_hdr <= 0; end
+                    end else if (chunk_kind == 2'd2) begin // data
+                        if (!data_chunk_ok)
+                            st <= S_BAD;
+                        else begin
+                            parser <= P_PCM; streaming <= 1;
+                            data_length <= chunk_size; data_left <= chunk_size;
+                            // Header consumption already advanced addr/index;
+                            // a sector-boundary payload starts at offset zero.
+                            data_start <= addr;
+                            data_start_off <= parse_resume == S_REQ ? 9'd0 : parse_idx;
+                            pcm_phase <= 0;
+                        end
+                    end else if (chunk_empty) parser <= P_CHUNK;
+                    else parser <= P_SKIP;
+                end
+                S_BAD: begin
+                    sec_read <= 0;
+                    if ((!file_valid && base_lba < SCAN_MAX) || !enable) begin
+                        if (enable) begin
+                            base_lba <= base_lba + 32'd1; addr <= base_lba + 32'd1;
+                            st <= S_REQ;
+                        end else begin started <= 0; st <= S_IDLE; end
+                        parser <= P_RIFF; file_pos <= 0; field_idx <= 0;
+                        read_offset <= 0; fmt_ok <= 0; streaming <= 0;
+                        sum_acc <= 0; sum_sec <= 0; sum16 <= 0;
+                    end
+                end
                 default: st <= S_IDLE;
             endcase
         end
     end
-
     // ==================== 48kHz 节拍 + 握手发送（sd 域）====================
     reg  [31:0] acc;
     wire tick = ((acc + SAMPLE_RATE) >= SD_CLK_HZ);
@@ -297,7 +382,7 @@ module wav_audio #(
             s_toggle <= 1'b0;
             rdp      <= 12'd0;                         // rdp 唯一驱动点
         end else if (tick) begin
-            if (!buf_empty) begin
+            if (sbuf_re) begin
                 rdp <= rdp + 12'd1;
             end
             // 缓冲空（例如正在给图片加载让路）：保持上一个样本，
@@ -336,28 +421,29 @@ module wav_audio #(
     end
 
     // ==================== 音频输出（vid 域）====================
-    reg [1:0]  tog_sync;
+    reg [2:0]  tog_sync;
     reg [23:0] h_l, h_r;             // 持稳样本（上一个有效样本）
 
     always @(posedge vid_clk or posedge vid_rst) begin
         if (vid_rst) begin
-            tog_sync  <= 2'd0;
+            tog_sync  <= 3'd0;
             h_l       <= 24'd0;
             h_r       <= 24'd0;
             aud_valid <= 1'b0;
             aud_left  <= 24'd0;
             aud_right <= 24'd0;
         end else begin
-            tog_sync <= {tog_sync[0], s_toggle};
-            // toggle 变化 = sd 域刚送来一个新样本（s_l/s_r 已稳定 ≥2 个视频时钟）
-            if (tog_sync[1] ^ tog_sync[0]) begin
+            tog_sync <= {tog_sync[1:0], s_toggle};
+            // 只消费同步链后两拍；第一级 tog_sync[0] 不参与数据采用。
+            // s_l/s_r 持稳一个采样周期，采用时已经稳定至少两个视频时钟。
+            if (tog_sync[2] ^ tog_sync[1]) begin
                 h_l <= s_l;
                 h_r <= s_r;
             end
             // 精确 48kHz 输出，一个节拍都不少
             if (vtick) begin
-                aud_left  <= SELFTEST ? (st_amp ? {st_tri, 8'b0} : 24'd0) : h_l;
-                aud_right <= SELFTEST ? (st_amp ? {st_tri, 8'b0} : 24'd0) : h_r;
+                aud_left  <= (SELFTEST == 2'd1) ? (st_amp ? {st_tri, 8'b0} : 24'd0) : h_l;
+                aud_right <= (SELFTEST == 2'd1) ? (st_amp ? {st_tri, 8'b0} : 24'd0) : h_r;
                 aud_valid <= 1'b1;
             end else begin
                 aud_valid <= 1'b0;
@@ -365,33 +451,34 @@ module wav_audio #(
         end
     end
 
-    // ==================== 采样环形缓冲的块 RAM 读写 ====================
-    // 写口与读口放在同一个 always 块里、读口寄存，安路综合器才会推断成 BRAM；
-    // 若把读值先做选择再寄存，或读写分处两个 always，就会退化成分布式 RAM
-    // （512x32 会吃掉约 2754 个 LUT，这是上一版的实测值）。
-    wire        sbuf_we  = (st == S_STR_DAT) && sec_read_data_valid && !draining
-                           && (byte_cnt[1:0] == 2'd3);
-    wire [31:0] sbuf_din = {sec_read_data, r_low, l16};
-    wire        sbuf_re  = tick && !buf_empty;
 
+    wire sbuf_we = st == S_PARSE && parser == P_PCM && pcm_phase == 3;
+    reg [31:0] sample_q;
+    reg [11:0] sample_addr;
+    reg sample_ready;
+    assign sbuf_re = tick && !buf_empty && sample_ready && sample_addr == rdp;
+    // Unconditional registered read keeps the RAM inference pattern. Publish
+    // only a valid prefetched word, so reset/underflow never exposes RAM Xs.
+    always @(posedge sd_clk) begin
+        if (SELFTEST == 2'd2) begin
+            if (!sd_rst && tick && buf_room) sbuf[wrp_cf] <= {cf_s16,cf_s16};
+        end else if (sbuf_we) sbuf[wrp] <= {sector_q,r_low,l16};
+        sample_q <= sbuf[rdp];
+    end
     always @(posedge sd_clk or posedge sd_rst) begin
         if (sd_rst) begin
-            s_l <= 24'd0;
-            s_r <= 24'd0;
+            sample_ready <= 0; sample_addr <= 0;
+            s_l <= 0; s_r <= 0; wrp_cf <= 0; cf_ph <= 0;
         end else begin
-            if (SELFTEST == 2'd2) begin
-                // 缓冲自检：用 48kHz 节拍把已知三角波写进缓冲（完全不碰 SD）
-                if (tick && (buf_cnt <= 12'd3967)) begin
-                    sbuf[wrp_cf] <= {cf_s16, cf_s16};
-                    wrp_cf       <= wrp_cf + 12'd1;
-                end
-            end else if (sbuf_we) sbuf[wrp] <= sbuf_din;
-            // 读口不加条件：rdp 只在 48kHz 节拍上推进，两次节拍之间读出的就是同一个样本，
-            // 因此“每拍都读”与原来的“只在 tick 读”完全等价；而综合器要求读口无条件
-            // 才肯推断成块 RAM（上一版加了 if(sbuf_re) 就被判成分布式 RAM）。
-            s_l <= {sbuf[rdp][15:0],  8'b0};              // 16bit → 24bit
-            s_r <= {sbuf[rdp][31:16], 8'b0};
+            sample_addr <= rdp; sample_ready <= !buf_empty;
+            if (sbuf_re) begin
+                s_l <= {sample_q[15:0],8'd0};
+                s_r <= {sample_q[31:16],8'd0};
+            end
+            if (SELFTEST == 2'd2 && tick && buf_room) begin
+                wrp_cf <= wrp_cf + 12'd1;
+                cf_ph <= cf_ph + 16'd1365;
+            end
         end
     end
-
 endmodule

@@ -31,17 +31,19 @@ module video_adjust(
     reg signed [8:0]  bright;
 
     always @(*) begin
-        case (sw_bright)                  // 亮度（默认 11 = 正常）
-            2'd0:    bright = 9'sd80;
-            2'd1:    bright = -9'sd40;
+        // OSD and processing share an ascending level: 0 < 1 < 2 < 3.
+        // Level 1 is neutral; wrapping 3 -> 0 is the only downward step.
+        case (sw_bright)
+            2'd0:    bright = -9'sd40;
+            2'd1:    bright = 9'sd0;
             2'd2:    bright = 9'sd40;
-            default: bright = 9'sd0;
+            default: bright = 9'sd80;
         endcase
         case (sw_contrast)                // 对比度增益（128 = 1.0×）
-            2'd0:    gain = 8'd192;
-            2'd1:    gain = 8'd96;
+            2'd0:    gain = 8'd96;
+            2'd1:    gain = 8'd128;
             2'd2:    gain = 8'd160;
-            default: gain = 8'd128;
+            default: gain = 8'd192;
         endcase
     end
 

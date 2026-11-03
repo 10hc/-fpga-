@@ -1,446 +1,253 @@
-// -----------------------------------------------------------------------------
-// tb_bmp_scale.v - self checking testbench for bmp_scale
-//
-//   Three source images (plus a degenerate one) are pushed through the scaler
-//   one pixel per clock, the downstream ready is pseudo random (low about one
-//   clock in five) and every accepted output pixel is compared against the
-//   nearest neighbour expectation computed here from the same "fit and centre"
-//   mapping.
-//
-//   The source is paced so that at most two source rows are in flight: the DUT
-//   only owns a three row line buffer (and has no input ready output), so a
-//   source that runs further ahead could not be absorbed.  A real source (an
-//   SD card BMP reader driven by the video pipeline) behaves the same way.
-// -----------------------------------------------------------------------------
-`timescale 1ns / 1ps
-
+`timescale 1ns/1ps
+// Independent integer-coordinate oracle, a sector SD model with byte gaps,
+// and the actual asynchronous FIFO / frame writer at unrelated clock phases.
 module tb_bmp_scale;
+reg clk=0, mem_clk=0, rst=1;
+always #5 clk=~clk;
+always #4 mem_clk=~mem_clk;
+reg scan_start=0, load_start=0, abort=0;
+wire ready, scan_done, found, req, ack, pixel_en, load_done, load_error;
+wire [2:0] found_count;
+wire [23:0] pixel;
+wire sd_req;
+wire [31:0] sd_addr;
+reg [7:0] sd_data=0;
+reg sd_valid=0, sd_end=0;
+wire write_ready, write_idle, write_finish;
+reg [3:0] abort_hold=0;
+wire writer_abort=abort || abort_hold!=0;
+reg [1:0] buffer_index=0;
+integer w=640, h=480, td=0, off=54, bad=0, short_at=-1, sectors=0;
+integer card_state=0, byte_index=0, card_addr=0, sector_length=512;
+integer out_count=0, mem_count=0, finishes=0, loads=0, errors=0, case_no=0;
+integer cycle=0, stalls=0, line_stride, file_size, fit_w, fit_h, left, top;
+reg [23:0] last_pixel;
+reg last_stalled=0;
+reg mem_busy=0;
+wire mem_we;
+wire [20:0] mem_addr;
+wire [31:0] mem_data;
 
-    // ---------------- clock / reset ----------------
-    reg clk;
-    initial clk = 1'b0;
-    always #5 clk = ~clk;                        // 100 MHz
+bmp_read dut(
+    .clk(clk),.rst(rst),.ready(ready),.scan_start(scan_start),
+    .scan_start_sector(32'd100),.scan_max_sector(32'd100),.scan_target_count(3'd1),
+    .scan_done(scan_done),.scan_found_valid(found),.scan_found_sector(),.scan_found_total(found_count),
+    .jump_en(1'b1),.jump_count(3'd1),.jump_sector0(32'd100),
+    .jump_sector1(32'd0),.jump_sector2(32'd0),.jump_sector3(32'd0),
+    .load_start(load_start),.load_sector(32'd100),.sd_init_done(1'b1),.state_code(),
+    .bmp_width(16'd640),.bmp_height(16'd480),.write_req(req),.write_req_ack(ack),
+    .sd_sec_read(sd_req),.sd_sec_read_addr(sd_addr),.sd_sec_read_data(sd_data),
+    .sd_sec_read_data_valid(sd_valid),.sd_sec_read_end(sd_end),
+    .bmp_data_ready(write_ready),.abort(abort),.load_done(load_done),.load_error(load_error),
+    .bmp_data_wr_en(pixel_en),.bmp_data(pixel)
+);
+frame_read_write memory_path(
+    .rst(rst),.mem_clk(mem_clk),.Sdr_init_done(!rst),.Sdr_init_ref_vld(1'b0),.Sdr_busy(mem_busy),
+    .App_rd_en(),.App_rd_addr(),.Sdr_rd_en(1'b0),.Sdr_rd_dout(32'd0),
+    .read_clk(clk),.read_req(1'b0),.read_req_ack(),.read_finish(),
+    .read_addr_0(21'd0),.read_addr_1(21'd307200),.read_addr_2(21'd614400),.read_addr_3(21'd921600),
+    .read_addr_index(2'd0),.read_len(21'd307200),.read_en(1'b0),.read_data(),
+    .App_wr_en(mem_we),.App_wr_addr(mem_addr),.App_wr_din(mem_data),.App_wr_dm(),
+    .write_clk(clk),.write_req(req),.write_req_ack(ack),.write_finish(write_finish),
+    .write_abort(writer_abort),.write_idle(write_idle),.write_ready(write_ready),
+    .write_addr_0(21'd0),.write_addr_1(21'd307200),.write_addr_2(21'd614400),.write_addr_3(21'd921600),
+    .write_addr_index(buffer_index),.write_len(21'd307200),.write_en(pixel_en),.write_data({pixel,8'd0}),
+    .trans_abort(1'b1),.trans_en(1'b0),.trans_effect(2'd0),.trans_offset(10'd0),
+    .trans_old_base(21'd0),.trans_new_base(21'd0),.dbg_rd_state(),.dbg_rd_wrbusy(),.dbg_rd_req2(),.dbg_rd_init()
+);
 
-    reg         rst;
-    reg  [15:0] src_w, src_h;
-    reg         in_de;
-    reg  [23:0] in_rgb;
-    reg         out_ready;
-
-    wire        out_de;
-    wire [23:0] out_rgb;
-    wire        frame_done;
-
-    bmp_scale dut (
-        .clk        (clk),
-        .rst        (rst),
-        .src_w      (src_w),
-        .src_h      (src_h),
-        .in_de      (in_de),
-        .in_rgb     (in_rgb),
-        .out_ready  (out_ready),
-        .out_de     (out_de),
-        .out_rgb    (out_rgb),
-        .frame_done (frame_done)
-    );
-
-    // ---------------- downstream ready: pseudo random ----------------
-    reg [15:0] lfsr;
-    initial begin
-        lfsr      = 16'hACE1;
-        out_ready = 1'b1;
+function [23:0] source_pixel;
+    input integer x,y;
+    reg [7:0] r,g,b;
+    begin r=(x*13+y*7+case_no*19); g=(y*11+x/256); b=(x*3+y/256); source_pixel={r,g,b}; end
+endfunction
+function [23:0] expected_pixel;
+    input integer n;
+    integer x,y,sx,sy;
+    begin
+        x=n%640; y=479-n/640;
+        if(x<left || x>=left+fit_w || y<top || y>=top+fit_h) expected_pixel=0;
+        else begin sx=(x-left)*w/fit_w; sy=(y-top)*h/fit_h; expected_pixel=source_pixel(sx,sy); end
     end
-    always @(posedge clk) begin
-        lfsr      <= {lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
-        out_ready <= ((lfsr % 16'd5) != 16'd0);   // low 1 clock in 5 on average
+endfunction
+function [7:0] file_byte;
+    input integer a;
+    integer raw_y, y, x, component, field;
+    reg [23:0] p;
+    begin
+        file_byte=0;
+        case(a)
+            0:file_byte="B"; 1:file_byte=bad==1 ? "X" : "M";
+            2,3,4,5:begin field=bad==2 ? file_size-1 : file_size; file_byte=field>>((a-2)*8); end
+            10,11,12,13:begin field=bad==12 ? 30 : off; file_byte=field>>((a-10)*8); end
+            14,15,16,17:begin field=bad==3 ? 12 : 40; file_byte=field>>((a-14)*8); end
+            18,19,20,21:begin field=bad==4 ? 65536+w : (bad==8 ? 0 : (bad==10 ? 2049 : w)); file_byte=field>>((a-18)*8); end
+            22,23,24,25:begin field=bad==9 ? 0 : (bad==11 ? 32'h80000000 : (td ? -h : h)); file_byte=field>>((a-22)*8); end
+            26:file_byte=bad==5 ? 2 : 1;
+            28:file_byte=bad==6 ? 32 : 24;
+            30:file_byte=bad==7 ? 1 : 0;
+            default:if(a>=off && a<file_size) begin
+                raw_y=(a-off)/line_stride; y=td ? raw_y : h-1-raw_y;
+                x=((a-off)%line_stride)/3; component=((a-off)%line_stride)%3;
+                p=source_pixel(x,y);
+                if(x>=w) file_byte=8'ha5; // nonzero padding exposes alignment errors
+                else file_byte=p>>(component*8);
+            end
+        endcase
     end
+endfunction
 
-    // =====================================================================
-    // test images
-    // =====================================================================
-    function [23:0] src_pix;
-        input integer sel;
-        input integer x;
-        input integer y;
-        integer t;
-        begin
-            case (sel)
-            0: begin  // 800x600 : red/green gradient + 40x40 blue tag at (100,100)
-                if ((x >= 100) && (x < 140) && (y >= 100) && (y < 140))
-                    src_pix = 24'h0000ff;
-                else begin
-                    t = (x * 255) / 799;
-                    src_pix = {t[7:0], (255 - t), 8'h00};
-                end
-            end
-            1: begin  // 320x240 : red / green / blue / white quadrants
-                if (y < 120)
-                    src_pix = (x < 160) ? 24'hff0000 : 24'h00ff00;
-                else
-                    src_pix = (x < 160) ? 24'h0000ff : 24'hffffff;
-            end
-            2: begin  // 1024x600 : vertical stripes, 16 px black / white
-                src_pix = ((x / 16) % 2 == 0) ? 24'hffffff : 24'h000000;
-            end
-            3: begin  // 1920x1080 : 32x32 checker board, two loud colours
-                src_pix = (((x / 32) + (y / 32)) % 2 == 0) ? 24'hff8000 : 24'h0040ff;
-            end
-            default: src_pix = 24'h000000;
-            endcase
+always @(posedge clk) begin
+    if(rst) begin card_state<=0; sd_valid<=0; sd_end<=0; abort_hold<=0; end
+    else begin
+        cycle=cycle+1; sd_valid<=0; sd_end<=0;
+        if(load_error) begin errors=errors+1; abort_hold<=15; end
+        else if(abort_hold!=0) abort_hold<=abort_hold-1;
+        if(load_done) begin
+            if(out_count!=307200) $fatal(1,"Incomplete success: %0d",out_count);
+            loads=loads+1;
         end
-    endfunction
-
-    // =====================================================================
-    // geometry model (same "fit and centre" mapping as the DUT)
-    // =====================================================================
-    integer g_w, g_h, g_sel;                     // current image
-    integer S, Dp, is_down;                      // scale ratio
-    integer a0x, a0y, limx, limy;                // boundary accumulators
-    integer colin [0:639];                       // target column is inside
-    integer colsrc[0:639];                       // source column used
-    integer rowin [0:479];                       // target row is inside
-    integer rowsrc[0:479];                       // stored row used
-    integer keeprow[0:4095];                     // source row is stored
-    integer ncols, nrows, nstored;
-    integer x0p, y0p, wrect, hrect;
-
-    task setup_geometry;
-        integer c, r, k;
-        begin
-            if ((640 * g_h) <= (480 * g_w)) begin
-                S  = g_w;
-                Dp = 640;
-            end else begin
-                S  = g_h;
-                Dp = 480;
-            end
-            is_down = (S > Dp);
-
-            if ((640 * g_h) <= (480 * g_w)) begin
-                a0x = 0;
-                a0y = 320 * g_h - 240 * g_w;
-            end else begin
-                a0x = -(320 * g_h - 240 * g_w);
-                a0y = 0;
-            end
-            limx = g_w * Dp;
-            limy = g_h * Dp;
-
-            k = 0;
-            for (c = 0; c < 640; c = c + 1) begin
-                if (((a0x + c * S) >= 0) && ((a0x + c * S) < limx)) begin
-                    colin[c]  = 1;
-                    colsrc[c] = (k * S) / Dp;
-                    k = k + 1;
-                end else begin
-                    colin[c]  = 0;
-                    colsrc[c] = 0;
-                end
-            end
-            ncols = k;
-
-            k = 0;
-            for (r = 0; r < 480; r = r + 1) begin
-                if (((a0y + r * S) >= 0) && ((a0y + r * S) < limy)) begin
-                    rowin[r]  = 1;
-                    rowsrc[r] = (k * S) / Dp;
-                    k = k + 1;
-                end else begin
-                    rowin[r]  = 0;
-                    rowsrc[r] = 0;
-                end
-            end
-            nrows = k;
-            nstored = (nrows == 0) ? 0 : (((nrows - 1) * S) / Dp) + 1;
-
-            // source rows that carry a stored row (pacing model)
-            for (r = 0; r < 4096; r = r + 1)
-                keeprow[r] = 0;
-            if (is_down == 0) begin
-                for (r = 0; r < g_h; r = r + 1)
-                    keeprow[r] = 1;
-            end else begin
-                for (k = 0; k < nrows; k = k + 1)
-                    if (((k * S) / Dp) < 4096)
-                        keeprow[(k * S) / Dp] = 1;
-            end
-
-            // report rectangle
-            x0p = 640; wrect = 0; y0p = 480; hrect = 0;
-            for (c = 0; c < 640; c = c + 1)
-                if (colin[c]) begin
-                    if (c < x0p) x0p = c;
-                    wrect = wrect + 1;
-                end
-            for (r = 0; r < 480; r = r + 1)
-                if (rowin[r]) begin
-                    if (r < y0p) y0p = r;
-                    hrect = hrect + 1;
-                end
-            if (wrect == 0) begin x0p = 0; y0p = 0; end
+        if(dut.u_scale.out_valid && !write_ready) stalls=stalls+1;
+        if(last_stalled && !abort && !writer_abort &&
+           (!dut.u_scale.out_valid || pixel!==last_pixel)) $fatal(1,"Unstable stalled output");
+        last_stalled=dut.u_scale.out_valid && !write_ready && !writer_abort;
+        last_pixel=pixel;
+        if(pixel_en) begin
+            if(memory_path.wr_fifo_full) $fatal(1,"FIFO overflow");
+            if(pixel!==expected_pixel(out_count))
+                $fatal(1,"Pixel mismatch case=%0d n=%0d got=%h expected=%h",case_no,out_count,pixel,expected_pixel(out_count));
+            out_count=out_count+1;
+            if(out_count>307200) $fatal(1,"Extra output");
         end
-    endtask
-
-    // =====================================================================
-    // output checker
-    // =====================================================================
-    integer chk_pix;            // accepted pixels of the current frame
-    integer frame_mism;         // mismatches of the current frame
-    integer frame_border;       // border pixels that were not black
-    integer frame_done_cnt;     // frame_done pulses of the current frame
-    integer overrun;            // pixels beyond 307200 in one frame
-    integer shown;              // mismatch lines printed for this frame
-    reg     frm_seen;           // a frame just finished
-    integer g_fail;             // global problem counter
-    integer wd_fires;           // watchdog substitutions (black row inserted)
-    integer cur_wait, max_wait; // consecutive wait cycles
-    integer xx, yy;
-    reg [23:0] exp_px;
-
-    initial begin
-        chk_pix        = 0;
-        frame_mism     = 0;
-        frame_border   = 0;
-        frame_done_cnt = 0;
-        overrun        = 0;
-        shown          = 0;
-        frm_seen       = 1'b0;
-        g_fail         = 0;
-        wd_fires       = 0;
-        cur_wait       = 0;
-        max_wait       = 0;
+        case(card_state)
+            0:if(sd_req) begin
+                card_addr<=sd_addr; byte_index<=0;
+                sector_length<=sectors==short_at ? 117 : 512;
+                sectors=sectors+1; card_state<=1;
+            end
+            1:if(cycle%7!=0) begin
+                sd_data<=file_byte((card_addr-100)*512+byte_index); sd_valid<=1;
+                if(byte_index==sector_length-1) begin
+                    if(case_no%2==0) begin sd_end<=1; card_state<=3; end
+                    else card_state<=2;
+                end
+                else byte_index<=byte_index+1;
+            end
+            2:begin sd_end<=1; card_state<=3; end
+            3:if(!sd_req) card_state<=0;
+        endcase
     end
+end
+always @(posedge mem_clk) if(!rst) begin
+    // Long refresh/contention windows force the image producer to stop.
+    mem_busy <= cycle%5000 < 2500;
+    if(mem_we) begin
+        if(memory_path.write_buf.empty_flag) $fatal(1,"FIFO underflow");
+        if(mem_data!=={expected_pixel(mem_count),8'd0}) $fatal(1,"SDRAM data mismatch n=%0d got=%h",mem_count,mem_data);
+        if(mem_addr!==buffer_index*307200+(479-mem_count/640)*640+mem_count%640)
+            $fatal(1,"SDRAM address mismatch");
+        mem_count=mem_count+1;
+    end
+    if(write_finish) begin
+        if(mem_count!=307200) $fatal(1,"Short memory frame %0d",mem_count);
+        finishes=finishes+1;
+    end
+end
 
-    always @(posedge clk) begin
-        if (rst) begin
-            chk_pix        <= 0;
-            frame_mism     <= 0;
-            frame_border   <= 0;
-            frame_done_cnt <= 0;
-            overrun        <= 0;
-            shown          <= 0;
-            frm_seen       <= 1'b0;
-        end else begin
-            frm_seen <= 1'b0;
-
-            if (frame_done) begin
-                frame_done_cnt <= frame_done_cnt + 1;
-                frm_seen       <= 1'b1;
-                if (chk_pix != 307200) begin
-                    $display("  ERROR: frame_done after %0d pixels (expected 307200)", chk_pix);
-                    g_fail = g_fail + 1;
-                end
-            end
-
-            if (out_de && out_ready) begin
-                if (chk_pix >= 307200) begin
-                    overrun = overrun + 1;
-                    if (overrun == 1)
-                        $display("  ERROR: more than 307200 pixels in one frame");
-                end else begin
-                    xx = chk_pix % 640;
-                    yy = chk_pix / 640;
-                    if (colin[xx] && rowin[yy])
-                        exp_px = src_pix(g_sel, colsrc[xx], rowsrc[yy]);
-                    else
-                        exp_px = 24'h000000;
-
-                    if (out_rgb !== exp_px) begin
-                        frame_mism = frame_mism + 1;
-                        if (shown < 8) begin
-                            shown = shown + 1;
-                            $display("    MISMATCH at (%0d,%0d): got %06h expected %06h",
-                                     xx, yy, out_rgb, exp_px);
-                        end
-                    end
-                    if (!(colin[xx] && rowin[yy]) && (out_rgb !== 24'h000000))
-                        frame_border = frame_border + 1;
-
-                    chk_pix <= chk_pix + 1;
-                end
-            end
+task setup_case;
+    input integer iw,ih,itd,ioff;
+    begin
+        wait(ready && write_idle && card_state==0 && abort_hold==0);
+        repeat(8) @(negedge clk);
+        w=iw; h=ih; td=itd; off=ioff; bad=0; short_at=-1;
+        line_stride=(w*3+3)/4*4; file_size=off+line_stride*h;
+        if(w*480>=h*640) begin fit_w=640; fit_h=h*640/w; if(fit_h==0)fit_h=1; end
+        else begin fit_h=480; fit_w=w*480/h; if(fit_w==0)fit_w=1; end
+        left=(640-fit_w)/2; top=(480-fit_h)/2;
+        out_count=0; mem_count=0; sectors=0; case_no=case_no+1; buffer_index=case_no%2;
+    end
+endtask
+task load;
+    begin @(negedge clk); load_start=1; @(negedge clk); load_start=0; end
+endtask
+task successful_case;
+    input integer iw,ih,itd,ioff;
+    integer old_loads,old_finishes,old_errors;
+    begin
+        setup_case(iw,ih,itd,ioff);
+        old_loads=loads; old_finishes=finishes; old_errors=errors;
+        @(negedge clk); scan_start=1; @(negedge clk); scan_start=0;
+        wait(scan_done); @(negedge clk);
+        if(found_count!=1) $fatal(1,"Dimension not scanned: %0dx%0d",w,h);
+        wait(ready); load;
+        wait(loads>old_loads || errors>old_errors);
+        if(errors!=old_errors) $fatal(1,"Valid BMP rejected");
+        wait(finishes>old_finishes); wait(ready && write_idle);
+        $display("PASS BMP %0dx%0d top_down=%0d offset=%0d fit=%0dx%0d pixels=%0d sectors=%0d",w,h,td,off,fit_w,fit_h,out_count,sectors);
+    end
+endtask
+integer i,old_errors,old_loads,old_finishes;
+initial begin
+    // The existing writer arbitrates on App_rd_busy, not on Sdr_busy.
+    // Model long display-read bursts at that arbitration interface.
+    force memory_path.App_rd_busy=mem_busy;
+    #100; @(negedge clk); rst=0;
+    if(!$test$plusargs("FAULT_ONLY")) begin
+    successful_case(640,480,0,54);
+    successful_case(320,240,0,54);
+    successful_case(800,600,0,54);
+    successful_case(800,800,0,54);
+    successful_case(241,479,1,70);
+    successful_case(1920,1080,1,1024);
+    successful_case(641,481,0,54);
+    successful_case(1,1,0,54);
+    successful_case(2048,1,1,54);
+    successful_case(1,2048,0,54);
+    successful_case(639,479,1,509);
+    end
+    for(i=1;i<=12;i=i+1) begin
+        setup_case(321,241,0,54); bad=i; old_errors=errors; old_loads=loads; old_finishes=finishes;
+        load; wait(errors>old_errors); wait(ready && write_idle && abort_hold==0);
+        if(out_count!=0 || loads!=old_loads || finishes!=old_finishes) $fatal(1,"Invalid header published");
+        $display("PASS reject header %0d",i);
+    end
+    setup_case(640,480,0,54); short_at=0; old_errors=errors;
+    load; wait(errors>old_errors); if(out_count!=0) $fatal(1,"Short header accepted");
+    $display("PASS short header");
+    setup_case(640,480,0,54); short_at=20; old_errors=errors; old_loads=loads; old_finishes=finishes;
+    load; wait(errors>old_errors); wait(ready && write_idle && abort_hold==0);
+    if(loads!=old_loads || finishes!=old_finishes) $fatal(1,"Short payload published");
+    $display("PASS short payload, partial words=%0d",out_count);
+    setup_case(800,600,1,54); old_errors=errors; old_loads=loads;
+    load; wait(out_count>2000 && sd_req); @(negedge clk); abort=1;
+    @(negedge clk); abort=0; wait(errors>old_errors); wait(ready && write_idle && abort_hold==0);
+    if(loads!=old_loads) $fatal(1,"Cancelled frame published");
+    $display("PASS cancel during SD receive");
+    setup_case(1,1,0,54); old_errors=errors;
+    load; wait(dut.u_scale.out_valid && !write_ready); @(negedge clk); abort=1;
+    @(negedge clk); abort=0;
+    wait(errors>old_errors); wait(ready && write_idle && abort_hold==0);
+    $display("PASS cancel while output stalled");
+    setup_case(320,240,0,54); old_errors=errors;
+    load; wait(sd_req && dut.state==2); @(negedge clk); abort=1;
+    @(negedge clk); abort=0; wait(errors>old_errors); wait(ready && write_idle && abort_hold==0);
+    if(out_count!=0) $fatal(1,"Cancelled header produced pixels");
+    $display("PASS cancel during header receive");
+    // Cancellation must remain sticky after the SD transaction has drained,
+    // including the cycle that publishes the registered validation result.
+    for(i=5;i<=10;i=i+1) begin
+        if(i!=9) begin
+            setup_case(320,240,0,54); old_errors=errors; old_loads=loads;
+            load; wait(dut.state==i); @(negedge clk); abort=1;
+            @(negedge clk); abort=0;
+            wait(errors>old_errors); wait(ready && write_idle && abort_hold==0);
+            if(out_count!=0 || loads!=old_loads) $fatal(1,"Validation cancel published a frame");
+            $display("PASS cancel validation stage %0d",i);
         end
     end
-
-    // structural guards
-    always @(posedge clk) begin
-        if (!rst) begin
-            if (out_de && !out_ready)
-                $display("  ERROR: out_de asserted while out_ready is low");
-            if (dut.wr_push && (dut.fifo_cnt == 2'd3))
-                $display("  ERROR: line buffer row FIFO overflow at %0t", $time);
-            if (dut.st == 2'd1) begin
-                cur_wait = cur_wait + 1;
-                if (cur_wait > max_wait) max_wait = cur_wait;
-            end else begin
-                cur_wait = 0;
-            end
-            if ((dut.st == 2'd1) && (dut.wd_cnt == 16'hFFFF)) begin
-                wd_fires = wd_fires + 1;
-                if (wd_fires < 6)
-                    $display("  WARNING: row watchdog t=%0t img=%0d fifo=%0d chk=%0d waited=%0d",
-                             $time, g_sel, dut.fifo_cnt, chk_pix, max_wait);
-            end
-        end
-    end
-
-    // =====================================================================
-    // source: feed one image, paced to two rows in flight
-    // =====================================================================
-    integer pushed_kept;
-
-    function integer consumed_rows;
-        input dummy;
-        begin
-            if (chk_pix >= 307200)       consumed_rows = nstored;
-            else if (rowin[chk_pix/640]) consumed_rows = rowsrc[chk_pix/640];
-            else                         consumed_rows = 0;
-        end
-    endfunction
-
-    task feed_frame;
-        integer r, c, g;
-        begin
-            for (r = 0; r < g_h; r = r + 1) begin
-                if ((r < 4096) && keeprow[r]) begin
-                    g = 0;
-                    while (((pushed_kept - consumed_rows(0)) >= 2) && (g < 4000000)) begin
-                        @(posedge clk);
-                        g = g + 1;
-                    end
-                    if (g >= 4000000) $display("  ERROR: source pacing timed out");
-                end
-                for (c = 0; c < g_w; c = c + 1) begin
-                    @(posedge clk);
-                    in_de  <= 1'b1;
-                    in_rgb <= src_pix(g_sel, c, r);
-                end
-                @(posedge clk);
-                in_de <= 1'b0;
-                if ((r < 4096) && keeprow[r])
-                    pushed_kept = pushed_kept + 1;
-            end
-            @(posedge clk);
-            in_de <= 1'b0;
-        end
-    endtask
-
-    task wait_frame_done;
-        integer g;
-        begin
-            g = 0;
-            while (!frm_seen && (g < 200000000)) begin
-                @(posedge clk);
-                g = g + 1;
-            end
-            if (g >= 200000000) begin
-                $display("  ERROR: no frame_done (timeout)");
-                g_fail = g_fail + 1;
-            end
-        end
-    endtask
-
-    // =====================================================================
-    // one test case
-    // =====================================================================
-    integer f_pix, f_mism, f_border, f_done;
-
-    task run_frame;
-        input integer w;
-        input integer h;
-        input integer sel;
-        input integer do_rst;
-        input integer idx;
-        begin
-            g_w   = w;
-            g_h   = h;
-            g_sel = sel;
-            setup_geometry;
-
-            if (do_rst) begin
-                rst    = 1'b1;
-                src_w  = w[15:0];
-                src_h  = h[15:0];
-                in_de  = 1'b0;
-                in_rgb = 24'h000000;
-                repeat (6) @(posedge clk);
-                rst = 1'b0;
-                @(posedge clk);
-            end else begin
-                // the DUT has just finished a frame: update the size inside the
-                // frame gap window
-                src_w = w[15:0];
-                src_h = h[15:0];
-            end
-
-            pushed_kept = 0;
-            feed_frame;
-            wait_frame_done;
-
-            f_pix    = chk_pix;
-            f_mism   = frame_mism;
-            f_border = frame_border;
-            f_done   = frame_done_cnt;
-
-            if ((f_pix == 307200) && (f_mism == 0) && (f_border == 0) &&
-                (f_done == 1) && (overrun == 0)) begin
-                $display("  image %0d : %0dx%-4d rect=(%0d,%0d,%0d,%0d) pixels=%0d border=%0d mismatches=%0d frame_done=%0d maxwait=%0d wdfires=%0d  PASS",
-                         idx, w, h, x0p, y0p, wrect, hrect, f_pix, f_border, f_mism, f_done, max_wait, wd_fires);
-            end else begin
-                $display("  image %0d : %0dx%-4d rect=(%0d,%0d,%0d,%0d) pixels=%0d border=%0d mismatches=%0d frame_done=%0d maxwait=%0d wdfires=%0d  FAIL",
-                         idx, w, h, x0p, y0p, wrect, hrect, f_pix, f_border, f_mism, f_done, max_wait, wd_fires);
-                g_fail = g_fail + 1;
-            end
-
-            // restart the per frame counters
-            frame_mism     = 0;
-            frame_border   = 0;
-            frame_done_cnt = 0;
-            overrun        = 0;
-            shown          = 0;
-            chk_pix        = 0;
-            max_wait       = 0;
-            cur_wait       = 0;
-        end
-    endtask
-
-    // =====================================================================
-    // main
-    // =====================================================================
-    initial begin
-        rst    = 1'b1;
-        src_w  = 16'd800;
-        src_h  = 16'd600;
-        in_de  = 1'b0;
-        in_rgb = 24'h000000;
-
-        $display("# ------------------------------------------------------------");
-        $display("# bmp_scale : nearest neighbour 640x480 scaler test");
-        $display("# ------------------------------------------------------------");
-
-        //                 w     h    image  reset  index
-        run_frame(       800,  600,   0,     1,     0);   // downscale, 4:3
-        run_frame(       320,  240,   1,     1,     1);   // upscale  x2
-        run_frame(      1024,  600,   2,     1,     2);   // downscale, 16:9-ish
-        run_frame(      1024,  600,   2,     0,     2);   // back to back frame
-        run_frame(       800,  600,   0,     0,     3);   // size change, no reset
-        run_frame(         0,    0,   0,     1,     4);   // degenerate source
-        run_frame(      1920, 1080,   3,     1,     5);   // big downscale, 16:9
-
-        $display("# ------------------------------------------------------------");
-        if (g_fail == 0)
-            $display("RESULT: PASS");
-        else
-            $display("RESULT: FAIL (%0d problem(s))", g_fail);
-        $display("# ------------------------------------------------------------");
-        $finish;
-    end
-
-    // global watchdog
-    initial begin
-        #2000000000;
-        $display("RESULT: FAIL (global timeout)");
-        $finish;
-    end
-
+    successful_case(321,241,1,54);
+    if(stalls==0) $fatal(1,"Backpressure was not exercised");
+    $display("BMP_ADAPTIVE_ALL_PASSED cases=%0d stalls=%0d",case_no,stalls); $finish;
+end
+initial begin #1000000000; $fatal(1,"BMP test timeout case=%0d state=%0d scale=%0d memstate=%0d req=%b ack=%b idle=%b hold=%0d out=%0d errors=%0d old_errors=%0d loads=%0d card=%0d",case_no,dut.state,dut.u_scale.state,memory_path.frame_fifo_write_m0.state,req,ack,write_idle,abort_hold,out_count,errors,old_errors,loads,card_state); end
 endmodule

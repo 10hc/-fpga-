@@ -1,400 +1,180 @@
-// -----------------------------------------------------------------------------
-// bmp_scale.v - nearest neighbour picture scaler for a fixed 640x480 raster
-//
-//   Source stream : src_w * src_h pixels, row major, one pixel per clock,
-//                   RGB888.  The module does not care about the vertical
-//                   orientation: the first row received is the first target
-//                   row.  No "frame start" pulse is needed - src_w / src_h
-//                   alone describe a frame (they may change between frames,
-//                   but must stay stable while one frame is being received).
-//   Output stream : exactly 640*480 pixels, row major, on the fixed raster,
-//                   with an out_ready handshake.  Aspect ratio is preserved,
-//                   the picture is centred and the rest is filled with black.
-//
-//   Geometry (no multiplier and no divider, shifts / adds only):
-//     The scale factor is the same on both axes and is expressed as a ratio
-//         S / D          with   point(c) = A0 + c*S   (c = target coordinate)
-//       width limited  (640*src_h <= 480*src_w) : S = src_w, D = 640
-//       height limited (otherwise)              : S = src_h, D = 480
-//     A target coordinate c belongs to the picture when
-//         0 <= A0 + c*S < src_axis_length * D
-//     A0 is 0 on the axis that fills the raster and
-//     +-(320*src_h - 240*src_w) on the centred axis.  This symmetric form is
-//     exactly the continuous "fit and centre" mapping evaluated at integer
-//     target coordinates, so the whole thing needs no division at all.
-//     Inside the picture the i-th (i = 0,1,2,...) content pixel samples the
-//     source index floor(i*S/D), tracked with an incremental accumulator
-//     (0/1 step when S <= D, pre-skipped when S > D).
-//
-//   Implementation:
-//     * The horizontal mapping is applied while a source row is written: only
-//       the sampled columns are stored, so a stored row is never wider than
-//       640 pixels.  The line buffer is declared 2048 x 24 as requested and is
-//       used as three slots of 640 pixels (an elastic row FIFO), which lets the
-//       input run up to two rows ahead of the output.
-//     * The vertical mapping replays one stored row for every target row it
-//       covers, so an upscaled source row is emitted several times without
-//       touching the input stream again.
-//     * out_de is only asserted together with out_ready; a pixel that is not
-//       accepted is held and presented again (never dropped).
-//     * The source must deliver a row before the output needs it (the row
-//       FIFO holds three rows).  Should the output reach a row that has not
-//       arrived yet, the module waits; after 65536 clocks a watchdog inserts a
-//       black row instead of hanging forever.
-// -----------------------------------------------------------------------------
-`timescale 1ns / 1ps
-
-module bmp_scale (
-    input  wire        clk,          // 100 MHz, single clock domain
-    input  wire        rst,          // synchronous, active high
-    input  wire [15:0] src_w,        // source width  0..4096, stable per frame
-    input  wire [15:0] src_h,        // source height 0..4096, stable per frame
-    input  wire        in_de,        // 1 = in_rgb is a valid source pixel
-    input  wire [23:0] in_rgb,       // source pixel, RGB888
-    input  wire        out_ready,    // downstream can accept an output pixel
-    output reg         out_de,       // 1 = out_rgb is a valid output pixel
-    output reg  [23:0] out_rgb,      // output pixel on the fixed 640x480 raster
-    output reg         frame_done    // 1-clock pulse after the last pixel
+`timescale 1ns/1ps
+// Aspect-fit nearest-neighbour BMP rasterizer for a contiguous file. A sector
+// and a scaled row are cached in synchronous RAM. Output stalls never truncate
+// an SD transaction. Bottom-up output matches the SDRAM writer's vertical flip.
+module bmp_scale(
+    input clk, rst, start, abort,
+    input [11:0] src_w, src_h,
+    input top_down,
+    input [31:0] pixel_offset, base_sector,
+    input out_ready,
+    output out_valid,
+    output [23:0] out_rgb,
+    output reg busy, done, error,
+    output sd_req,
+    output reg [31:0] sd_addr,
+    input [7:0] sd_data,
+    input sd_valid, sd_end
 );
+localparam IDLE=0, GEOM=1, GEOM_END=2, ROW=3, DIV_Y=4, ROW_ADDR=5,
+           BYTE=6, BYTE_USE=7, RECEIVE=8, STORE=9, STEP_X=10,
+           EMIT_READ=11, EMIT=12, ROW_MUL=13, ROW_SUM=14;
+reg [3:0] state;
+reg [11:0] sw, sh;
+reg td, width_limited;
+reg [31:0] offset, base;
+reg [12:0] stride;
+reg [21:0] geom_rem;
+reg [9:0] geom_q, dw, dh, left_pad, bottom_pad;
+reg [9:0] ox, oy, dx;
+reg [21:0] row_rem;
+reg [11:0] sy, cached_sy, sx, target_x;
+reg row_cached, row_active;
+reg [12:0] phase_x;
+reg [31:0] cursor;
+reg [1:0] component;
+reg [23:0] rgb;
+reg [7:0] sector_mem [0:511];
+reg [23:0] line_mem [0:639];
+reg [7:0] sector_q;
+reg [23:0] line_q;
+reg [22:0] sector_tag;
+reg sector_cached, cancel_pending;
+reg [9:0] received;
+wire [9:0] line_addr = (ox >= left_pad && ox < left_pad + dw) ? ox-left_pad : 10'd0;
+wire inside_x = ox >= left_pad && ox < left_pad + dw;
+wire [11:0] file_row = td ? sy : sh-12'd1-sy;
+reg [11:0] file_row_q;
+reg [24:0] row_bytes_q;
+wire [21:0] sw480 = ({10'd0,src_w} << 9) - ({10'd0,src_w} << 5);
+wire [21:0] sh640 = ({10'd0,src_h} << 9) + ({10'd0,src_h} << 7);
+assign sd_req = state == RECEIVE;
+assign out_valid = state == EMIT && !abort && !cancel_pending;
+assign out_rgb = row_active && inside_x ? line_q : 24'd0;
 
-    // ------------------------------------------------------------------
-    // raster / buffer constants
-    // ------------------------------------------------------------------
-    localparam integer OUT_W   = 640;
-    localparam integer OUT_H   = 480;
-    localparam integer OUT_PIX = OUT_W * OUT_H;      // 307200
-    localparam integer SLOT_W  = 640;                // stored samples per row
+always @(posedge clk) begin
+    if (state == RECEIVE && sd_valid && received < 10'd512)
+        sector_mem[received[8:0]] <= sd_data;
+    sector_q <= sector_mem[cursor[8:0]];
+    if (state == STORE) line_mem[dx] <= rgb;
+    line_q <= line_mem[line_addr];
+end
 
-    localparam [1:0] ST_EMIT = 2'd0,                 // emitting output pixels
-                     ST_WAIT = 2'd1,                 // waiting for a source row
-                     ST_GAP  = 2'd2;                 // one idle cycle per frame
-
-    // ------------------------------------------------------------------
-    // slot ring: three line buffer slots at 0 / 640 / 1280
-    // ------------------------------------------------------------------
-    function [10:0] base_next;
-        input [10:0] b;
-        begin
-            base_next = (b == 11'd0)    ? 11'd640  :
-                        (b == 11'd640)  ? 11'd1280 : 11'd0;
-        end
-    endfunction
-
-    // ------------------------------------------------------------------
-    // scale geometry (combinational, from the source size)
-    // ------------------------------------------------------------------
-    wire [12:0] sw = src_w[12:0];
-    wire [12:0] sh = src_h[12:0];
-
-    wire [24:0] wx640 = ({12'd0, sw} << 9) + ({12'd0, sw} << 7);    // sw*640
-    wire [24:0] hy480 = ({12'd0, sh} << 9)  - ({12'd0, sh} << 5);   // sh*480
-    wire        width_lim = (wx640 >= hy480);        // 640*src_h <= 480*src_w
-
-    wire [12:0] S  = width_lim ? sw : sh;            // scale numerator
-    wire [9:0]  D  = width_lim ? 10'd640 : 10'd480;  // scale denominator
-    wire        down = (S > {3'd0, D});              // both axes downscale
-    wire [12:0] Sd = S - {3'd0, D};                  // S-D, valid when down
-
-    wire signed [24:0] S_s = {12'd0, S};             // signed helpers
-
-    // 320*src_h - 240*src_w  (centre offset numerator)
-    wire signed [24:0] h320 = ({12'd0, sh} << 8) + ({12'd0, sh} << 6);
-    wire signed [24:0] w240 = ({12'd0, sw} << 8) - ({12'd0, sw} << 4);
-    wire signed [24:0] a0c  = h320 - w240;
-    wire signed [24:0] a0x  = width_lim ? 25'sd0 : (25'sd0 - a0c);
-    wire signed [24:0] a0y  = width_lim ? a0c : 25'sd0;
-
-    // content limits (exclusive): src_axis_length * D
-    wire [24:0] w480 = ({12'd0, sw} << 9)  - ({12'd0, sw} << 5);    // sw*480
-    wire [24:0] h640 = ({12'd0, sh} << 10) - ({12'd0, sh} << 7);    // sh*640
-    wire [23:0] limx_u = width_lim ? wx640[23:0] : w480[23:0];
-    wire [23:0] limy_u = width_lim ? h640[23:0] : hy480[23:0];
-    wire signed [24:0] limx = {1'b0, limx_u};
-    wire signed [24:0] limy = {1'b0, limy_u};
-
-    wire        src_ok = (src_w != 16'd0) && (src_h != 16'd0);
-
-    // ------------------------------------------------------------------
-    // line buffer: 2048 x 24, one write port + one registered read port
-    // ------------------------------------------------------------------
-    reg [23:0] linebuf [0:2047];
-
-    reg [10:0] wr_base, rd_base;      // slot base of the write / read side
-    reg [1:0]  fifo_cnt;              // complete, not yet consumed rows (0..3)
-
-    // ------------------------------------------------------------------
-    // write side: sample the incoming row and store the sampled columns
-    // ------------------------------------------------------------------
-    reg [12:0] w_col;                 // source column index
-    reg [12:0] w_row;                 // source row index inside the frame
-    reg [12:0] w_hn;                  // horizontal sampling accumulator
-    reg [12:0] w_vn;                  // vertical   sampling accumulator
-    reg [10:0] w_ptr;                 // write offset inside the slot
-    reg        w_store;               // current source row is being stored
-
-    wire        col_keep = !down || (w_hn == 13'd0) || (w_hn > Sd);
-    wire [12:0] hn_sum   = w_hn + {3'd0, D};
-    wire [12:0] w_hn_nxt = (hn_sum >= S) ? (hn_sum - S) : hn_sum;
-
-    wire        row_keep = !down || (w_vn == 13'd0) || (w_vn > Sd);
-    wire [12:0] vn_sum   = w_vn + {3'd0, D};
-    wire [12:0] w_vn_nxt = (vn_sum >= S) ? (vn_sum - S) : vn_sum;
-
-    wire        last_col = (w_col == (sw - 13'd1));
-    wire        last_row = (w_row == (sh - 13'd1));
-
-    wire        we     = in_de && src_ok && w_store && col_keep;
-    wire [10:0] w_addr = wr_base + w_ptr;
-
-    wire        wr_row_end = in_de && src_ok && last_col;
-    wire        wr_push    = wr_row_end && w_store;
-    wire [1:0]  cnt_pushed = fifo_cnt + (wr_push ? 2'd1 : 2'd0);
-    // sampling decision for the next source row (accumulator + FIFO room)
-    wire [12:0] vn_use  = last_row ? 13'd0 : w_vn_nxt;
-    wire        keep_nxt = (!down || (vn_use == 13'd0) || (vn_use > Sd))
-                           && (cnt_pushed != 2'd3);
-
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            w_col   <= 13'd0;
-            w_row   <= 13'd0;
-            w_hn    <= 13'd0;
-            w_vn    <= 13'd0;
-            w_ptr   <= 11'd0;
-            w_store <= 1'b1;                 // row 0 is always sampled
-            wr_base <= 11'd0;
-        end else if (in_de && src_ok) begin
-            w_hn <= w_hn_nxt;
-            if (we && (w_ptr != 11'd639))
-                w_ptr <= w_ptr + 11'd1;
-
-            if (last_col) begin
-                w_col   <= 13'd0;
-                w_hn    <= 13'd0;
-                w_ptr   <= 11'd0;
-                if (w_store)
-                    wr_base <= base_next(wr_base);
-                w_vn    <= vn_use;
-                w_store <= keep_nxt;
-                w_row   <= last_row ? 13'd0 : (w_row + 13'd1);
-            end else begin
-                w_col <= w_col + 13'd1;
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        state<=IDLE; busy<=0; done<=0; error<=0; cancel_pending<=0;
+        sw<=0; sh<=0; td<=0; width_limited<=0; offset<=0; base<=0;
+        stride<=0; geom_rem<=0; geom_q<=0; dw<=0; dh<=0;
+        left_pad<=0; bottom_pad<=0; ox<=0; oy<=0; dx<=0;
+        row_rem<=0; sy<=0; cached_sy<=0; sx<=0; target_x<=0;
+        row_cached<=0; row_active<=0; phase_x<=0; cursor<=0;
+        component<=0; rgb<=0; sector_tag<=0; sector_cached<=0;
+        sd_addr<=0; received<=0;
+        file_row_q<=0; row_bytes_q<=0;
+    end else begin
+        done<=0; error<=0;
+        // Drain an issued sector before releasing the bus on cancellation.
+        if (abort && busy && state == RECEIVE) cancel_pending<=1;
+        if (abort && busy && state != RECEIVE) begin
+            state<=IDLE; busy<=0; error<=1; cancel_pending<=0;
+        end else case (state)
+            IDLE: if (start && (abort || src_w==0 || src_h==0 || src_w>2048 || src_h>2048)) begin
+                error<=1;
+            end else if (start) begin
+                sw<=src_w; sh<=src_h; td<=top_down;
+                offset<=pixel_offset; base<=base_sector;
+                stride<=(({1'b0,src_w} << 1)+{1'b0,src_w}+13'd3) & 13'h1ffc;
+                width_limited<=sw480 >= sh640;
+                geom_rem<=sw480 >= sh640 ? sh640 : sw480;
+                geom_q<=0; row_cached<=0; sector_cached<=0;
+                cancel_pending<=0; busy<=1; oy<=0; state<=GEOM;
             end
-        end
-    end
-
-    // ------------------------------------------------------------------
-    // read side
-    // ------------------------------------------------------------------
-    reg [1:0]  st;
-    reg [9:0]  ox;                    // target column inside the raster row
-    reg signed [24:0] bx;             // horizontal picture test accumulator
-    reg [12:0] mxn;                   // horizontal Bresenham fraction
-    reg [9:0]  mxi;                   // stored sample index (read offset)
-    reg        rowdat;                // this target row is inside the picture
-
-    reg signed [24:0] by;             // vertical picture test accumulator
-    reg [12:0] myn;                   // vertical Bresenham fraction
-
-    reg [18:0] px_cnt;                // accepted pixels of the current frame
-    reg [15:0] wd_cnt;                // wait watchdog
-    reg [1:0]  gap_cnt;               // frame gap counter (lets the caller
-                                      // update src_w/src_h between frames)
-
-    reg [23:0] rd_q;                  // presented pixel data
-    reg        rd_in;                 // presented pixel is inside the picture
-    reg        rd_val;                // presented pixel is valid
-
-    wire        bx_inside = (bx >= 25'sd0) && (bx < limx);
-    wire [13:0] mxn_sum   = {1'b0, mxn} + {1'b0, S};
-    wire [13:0] myn_sum   = {1'b0, myn} + {1'b0, S};
-    wire [13:0] D14       = {4'd0, D};
-
-    wire        pipe_adv = (!rd_val) || out_ready;
-    wire        px_acc   = rd_val && out_ready;
-
-    // ---- next state ---------------------------------------------------
-    reg [1:0]  st_n;
-    reg [9:0]  ox_n;
-    reg signed [24:0] bx_n, by_n;
-    reg [12:0] mxn_n, myn_n;
-    reg [9:0]  mxi_n;
-    reg        rowdat_n, rd_pop;
-    reg [10:0] addr_n;
-    reg        in_n, val_n;
-
-    reg        restart;
-    reg [1:0]  fifo_avail;
-    reg [1:0]  gap_cnt_n;
-
-    always @(*) begin
-        // hold by default
-        st_n = st;  ox_n = ox;  bx_n = bx;  mxn_n = mxn;  mxi_n = mxi;
-        rowdat_n = rowdat;  by_n = by;  myn_n = myn;
-        rd_pop = 1'b0;
-        restart = 1'b0;
-        fifo_avail = fifo_cnt;
-        gap_cnt_n  = gap_cnt;
-
-        if (st == ST_GAP) begin
-            if (gap_cnt != 2'd3) begin
-                // frame gap: the caller may change src_w/src_h here
-                gap_cnt_n = gap_cnt + 2'd1;
+            // The quotient is at most 640: this small iterative divider
+            // replaces a large combinational divider in the setup path.
+            GEOM: if (geom_rem >= (width_limited ? sw : sh)) begin
+                geom_rem<=geom_rem-(width_limited ? sw : sh);
+                geom_q<=geom_q+10'd1;
             end else begin
-                // frame start: load the whole geometry, then emit row 0
-                gap_cnt_n = 2'd0;
-                ox_n     = 10'd0;
-                bx_n     = a0x;
-                mxn_n    = 13'd0;
-                mxi_n    = 10'd0;
-                by_n     = a0y;
-                myn_n    = 13'd0;
-                rowdat_n = src_ok && (a0y >= 25'sd0) && (a0y < limy);
-                st_n     = (rowdat_n && (fifo_cnt == 2'd0)) ? ST_WAIT : ST_EMIT;
+                dw<=width_limited ? 10'd640 : (geom_q==0 ? 10'd1 : geom_q);
+                dh<=width_limited ? (geom_q==0 ? 10'd1 : geom_q) : 10'd480;
+                state<=GEOM_END;
             end
-        end else if (st == ST_WAIT) begin
-            if (fifo_cnt != 2'd0)
-                st_n = ST_EMIT;
-            else if (wd_cnt == 16'hFFFF) begin
-                rowdat_n = 1'b0;          // watchdog: black row, never hang
-                st_n     = ST_EMIT;
+            GEOM_END: begin
+                left_pad<=(10'd640-dw)>>1;
+                bottom_pad<=10'd480-dh-((10'd480-dh)>>1);
+                state<=ROW;
             end
-        end else begin
-            if (ox == 10'd639) begin
-                // ---- last pixel of a target row: set up the next row ----
-                ox_n  = 10'd0;
-                bx_n  = a0x;
-                mxn_n = 13'd0;
-                mxi_n = 10'd0;
-                by_n  = by + S_s;
-                if (down) begin
-                    // one stored row per target row (rows were pre-skipped)
-                    myn_n  = 13'd0;
-                    rd_pop = rowdat;
-                end else if (myn_sum >= D14) begin
-                    // 0/1 Bresenham step: this stored row has been used up
-                    myn_n  = myn_sum[12:0] - {3'd0, D};
-                    rd_pop = rowdat;
-                end else begin
-                    myn_n  = myn_sum[12:0];
-                end
-                rowdat_n   = src_ok && (by_n >= 25'sd0) && (by_n < limy);
-                fifo_avail = fifo_cnt - (rd_pop ? 2'd1 : 2'd0);
-                st_n = (rowdat_n && (fifo_avail == 2'd0)) ? ST_WAIT : ST_EMIT;
-            end else begin
-                // ---- mid row ----
-                ox_n = ox + 10'd1;
-                bx_n = bx + S_s;
-                if (bx_inside && rowdat) begin
-                    if (down) begin
-                        mxi_n = mxi + 10'd1;
-                    end else if (mxn_sum >= D14) begin
-                        mxn_n = mxn_sum[12:0] - {3'd0, D};
-                        mxi_n = mxi + 10'd1;
+            ROW: begin
+                ox<=0;
+                row_active<=oy>=bottom_pad && oy<bottom_pad+dh;
+                if (oy>=bottom_pad && oy<bottom_pad+dh) begin
+                    row_rem<=(dh-10'd1-(oy-bottom_pad))*sh;
+                    sy<=0; state<=DIV_Y;
+                end else state<=EMIT_READ;
+            end
+            DIV_Y: if (row_rem >= dh) begin
+                row_rem<=row_rem-dh; sy<=sy+12'd1;
+            end else if (row_cached && sy==cached_sy) state<=EMIT_READ;
+            else state<=ROW_ADDR;
+            ROW_ADDR: begin
+                file_row_q<=file_row; state<=ROW_MUL;
+            end
+            ROW_MUL: begin
+                row_bytes_q<=file_row_q*stride; state<=ROW_SUM;
+            end
+            ROW_SUM: begin
+                cursor<=offset+{7'd0,row_bytes_q}; component<=0;
+                sx<=0; target_x<=0; dx<=0; phase_x<=0;
+                state<=BYTE;
+            end
+            BYTE: if (sector_cached && cursor[31:9]==sector_tag)
+                state<=BYTE_USE;
+            else begin
+                sd_addr<=base+{9'd0,cursor[31:9]}; received<=0;
+                sector_cached<=0; state<=RECEIVE;
+            end
+            RECEIVE: begin
+                if (sd_valid && received < 10'd513) received<=received+10'd1;
+                if (sd_end) begin
+                    if (cancel_pending || abort ||
+                        (received + (sd_valid ? 10'd1 : 10'd0) != 10'd512)) begin
+                        busy<=0; error<=1; state<=IDLE; cancel_pending<=0;
                     end else begin
-                        mxn_n = mxn_sum[12:0];
+                        sector_tag<=cursor[31:9]; sector_cached<=1; state<=BYTE;
                     end
                 end
             end
-        end
-
-        // frame finished: the 640*480-th pixel has been accepted
-        if ((st == ST_EMIT) && px_acc && (px_cnt == OUT_PIX-1)) begin
-            restart    = 1'b1;
-            st_n       = ST_GAP;
-            rd_pop     = rowdat;          // release the last stored row
-            rowdat_n   = 1'b0;
-            ox_n       = 10'd0;
-            mxn_n      = 13'd0;
-            mxi_n      = 10'd0;
-            myn_n      = 13'd0;
-        end
-
-        // address / flags of the pixel described by the next state
-        addr_n = 11'd0;
-        in_n   = 1'b0;
-        val_n  = 1'b0;
-        if (st_n == ST_EMIT) begin
-            val_n = 1'b1;
-            in_n  = rowdat_n && (bx_n >= 25'sd0) && (bx_n < limx);
-            if (rowdat_n)
-                addr_n = (rd_pop ? base_next(rd_base) : rd_base) + mxi_n;
-        end
-    end
-
-    // ---- block RAM: one write port, one registered read port ----------
-    always @(posedge clk) begin
-        if (we)
-            linebuf[w_addr] <= in_rgb;
-        if (pipe_adv)
-            rd_q <= linebuf[addr_n];
-    end
-
-    // ---- control registers --------------------------------------------
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            st         <= ST_GAP;
-            ox         <= 10'd0;
-            bx         <= 25'sd0;
-            mxn        <= 13'd0;
-            mxi        <= 10'd0;
-            rowdat     <= 1'b0;
-            by         <= 25'sd0;
-            myn        <= 13'd0;
-            px_cnt     <= 19'd0;
-            wd_cnt     <= 16'd0;
-            gap_cnt    <= 2'd0;
-            rd_in      <= 1'b0;
-            rd_val     <= 1'b0;
-            rd_base    <= 11'd0;
-            fifo_cnt   <= 2'd0;
-            frame_done <= 1'b0;
-        end else begin
-            frame_done <= 1'b0;
-
-            if (pipe_adv) begin
-                st     <= st_n;
-                ox     <= ox_n;
-                bx     <= bx_n;
-                mxn    <= mxn_n;
-                mxi    <= mxi_n;
-                rowdat <= rowdat_n;
-                by     <= by_n;
-                myn    <= myn_n;
-                rd_in  <= in_n;
-                rd_val <= val_n;
-                gap_cnt <= gap_cnt_n;
+            BYTE_USE: begin
+                cursor<=cursor+32'd1;
+                case (component)
+                    0: begin rgb[7:0]<=sector_q; component<=1; state<=BYTE; end
+                    1: begin rgb[15:8]<=sector_q; component<=2; state<=BYTE; end
+                    2: begin
+                        rgb[23:16]<=sector_q; component<=0;
+                        if (sx==target_x) state<=STORE;
+                        else begin sx<=sx+12'd1; state<=BYTE; end
+                    end
+                    default: state<=IDLE;
+                endcase
             end
-
-            if (pipe_adv && rd_pop)
-                rd_base <= base_next(rd_base);
-
-            // elastic row FIFO: write side pushes, read side pops
-            fifo_cnt <= fifo_cnt + (wr_push ? 2'd1 : 2'd0)
-                                 - ((pipe_adv && rd_pop) ? 2'd1 : 2'd0);
-
-            if (px_acc) begin
-                if (px_cnt == OUT_PIX-1) begin
-                    frame_done <= 1'b1;
-                    px_cnt     <= 19'd0;
-                end else begin
-                    px_cnt <= px_cnt + 19'd1;
-                end
+            STORE: if (dx==dw-10'd1) begin
+                row_cached<=1; cached_sy<=sy; state<=EMIT_READ;
+            end else begin
+                dx<=dx+10'd1; phase_x<=phase_x+{1'b0,sw}; state<=STEP_X;
             end
-
-            if (st == ST_WAIT)
-                wd_cnt <= wd_cnt + 16'd1;
-            else
-                wd_cnt <= 16'd0;
-        end
+            STEP_X: if (phase_x >= dw) begin
+                phase_x<=phase_x-dw; target_x<=target_x+12'd1;
+            end else if (target_x==sx) state<=STORE;
+            else begin sx<=sx+12'd1; state<=BYTE; end
+            EMIT_READ: state<=EMIT;
+            EMIT: if (out_ready) begin
+                if (ox==10'd639) begin
+                    if (oy==10'd479) begin busy<=0; done<=1; state<=IDLE; end
+                    else begin oy<=oy+10'd1; state<=ROW; end
+                end else begin ox<=ox+10'd1; state<=EMIT_READ; end
+            end
+            default: begin busy<=0; error<=1; state<=IDLE; end
+        endcase
     end
-
-    // ------------------------------------------------------------------
-    // outputs: assert out_de only when out_ready is high
-    // ------------------------------------------------------------------
-    always @(*) begin
-        out_de  = rd_val && out_ready;
-        out_rgb = (rd_val && rd_in) ? rd_q : 24'h000000;
-    end
-
+end
 endmodule

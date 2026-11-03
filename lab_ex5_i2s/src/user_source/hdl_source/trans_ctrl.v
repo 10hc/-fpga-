@@ -5,7 +5,7 @@
 // 输出：
 //   trans_effect  : 0=滑动  1=栅格  2=淡入淡出
 //   trans_en      : 读控制器转场使能（滑动/栅格全程；淡出的"显示旧图"阶段）
-//   trans_offset  : 滑动=像素偏移(0~639)；栅格=对角线进度(0~68)
+//   trans_offset  : 滑动=像素偏移(0~640)；栅格=对角线进度(0~69)
 //   fade_factor   : 淡入淡出因子 0(黑)~256(不衰减)，其余效果恒为 256
 module trans_ctrl #(
     parameter integer SLIDE_STEP = 8,    // 滑动：每帧前进像素（8≈1.3s，越小越丝滑）
@@ -51,10 +51,16 @@ module trans_ctrl #(
             trans_frames <= 8'd0;
         end else if (switch_pulse) begin
             // 轮换效果并启动
-            // 注意：上板实测"栅格"效果花屏（2026-10-24），暂时停用，
-            // 只轮换 滑动(0) / 淡入淡出(2)，修好后把 FX_SLIDE 的下一效果改回 FX_GRID。
             case (trans_effect)
                 FX_SLIDE: begin
+                    trans_effect <= FX_GRID;
+                    trans_en     <= 1'b1;
+                    trans_offset <= 10'd0;
+                    fade_factor  <= 9'd256;
+                    f_phase      <= 2'd0;
+                    trans_frames <= 8'd0;
+                end
+                FX_GRID: begin
                     trans_effect <= FX_FADE;
                     trans_en     <= 1'b1;      // 淡出阶段：读控制器保持显示旧图
                     trans_offset <= 10'd0;     // 偏移0 = 整行旧图
@@ -62,11 +68,12 @@ module trans_ctrl #(
                     f_phase      <= F_OUT;
                     trans_frames <= 8'd0;
                 end
-                default: begin                  // FX_FADE（或 FX_GRID）→ 下一个是 SLIDE
+                default: begin                  // FX_FADE → 下一个是 SLIDE
                     trans_effect <= FX_SLIDE;
                     trans_en     <= 1'b1;
                     trans_offset <= 10'd0;
                     fade_factor  <= 9'd256;
+                    f_phase      <= 2'd0;
                     trans_frames <= 8'd0;
                 end
             endcase
